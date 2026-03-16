@@ -22,8 +22,8 @@ router.get('/health', (req, res) => {
         trading: positions.getStatus(),
         config: {
             defaultQuantity: process.env.DEFAULT_QUANTITY || '1000',
-            tpCents: process.env.TP_CENTS || '0.08',
-            slCents: process.env.SL_CENTS || '0.05',
+            emergencySlPct: (process.env.EMERGENCY_SL_PCT || '5') + '%',
+            exitStrategy: 'TV scaled exits (2%/4%) + emergency SL safety net',
             tradingHours: `${process.env.TRADING_START_HOUR || '7'}:00 - ${process.env.TRADING_END_HOUR || '16'}:00`
         }
     };

@@ -42,8 +42,7 @@ Set these in Railway's Variables tab:
 | `DEFAULT_QUANTITY` | No | Shares per trade (default: 1000) |
 | `MAX_POSITIONS` | No | Max concurrent positions (default: 3) |
 | `MAX_DAILY_LOSS` | No | Stop trading after this loss (default: -500) |
-| `TP_CENTS` | No | Take profit per share (default: 0.08) |
-| `SL_CENTS` | No | Stop loss per share (default: 0.05) |
+| `EMERGENCY_SL_PCT` | No | Emergency stop loss percentage (default: 5). Safety net only — TV scaled exits handle normal profit-taking |
 | `TRADING_START_HOUR` | No | Start hour EST (default: 7) |
 | `TRADING_END_HOUR` | No | End hour EST (default: 16) |
 | `DISCORD_WEBHOOK_URL` | No | Discord channel webhook for notifications |

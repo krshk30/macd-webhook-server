@@ -12,8 +12,7 @@ const { log } = require('../services/logger');
 const router = express.Router();
 
 const DEFAULT_QTY = () => parseInt(process.env.DEFAULT_QUANTITY || '1000');
-const TP_CENTS = () => parseFloat(process.env.TP_CENTS || '0.08');
-const SL_CENTS = () => parseFloat(process.env.SL_CENTS || '0.05');
+const EMERGENCY_SL_PCT = () => parseFloat(process.env.EMERGENCY_SL_PCT || '5');  // 5% emergency stop
 
 router.post('/webhook', async (req, res) => {
     const receiveTime = Date.now();
@@ -81,15 +80,18 @@ async function handleBuy(ticker, price, body) {
 
     const qty = DEFAULT_QTY();
     const entryPrice = parseFloat(price) || 0;
-    const tpPrice = entryPrice + TP_CENTS();
-    const slPrice = entryPrice - SL_CENTS();
 
-    // Place bracket order (buy + TP + SL) — single API call
+    // Emergency stop loss only — scaled exits from TV alerts handle profit-taking
+    // This is a safety net in case TV alerts fail, NOT the trading logic
+    const emergencySlPrice = entryPrice > 0
+        ? entryPrice * (1 - EMERGENCY_SL_PCT() / 100)
+        : 0;
+
     let result;
-    if (entryPrice > 0) {
-        result = await schwabService.placeBracketOrder(ticker, qty, tpPrice, slPrice);
+    if (entryPrice > 0 && emergencySlPrice > 0) {
+        // Place buy with emergency stop-loss attached (no take-profit)
+        result = await schwabService.placeBuyWithStopLoss(ticker, qty, emergencySlPrice);
     } else {
-        // No price provided — simple market buy
         result = await schwabService.placeBuyOrder(ticker, qty);
     }
 
@@ -103,8 +105,7 @@ async function handleBuy(ticker, price, body) {
         ticker,
         quantity: qty,
         entryPrice,
-        tp: tpPrice.toFixed(2),
-        sl: slPrice.toFixed(2),
+        emergencySL: emergencySlPrice.toFixed(2),
         orderId: result.orderId,
         schwabLatency: result.latency,
         path: body.path || 'unknown'

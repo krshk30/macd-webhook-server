@@ -243,9 +243,11 @@ async function placeSellOrder(ticker, quantity, reason) {
 }
 
 /**
- * Place a bracket order (buy + OTO stop-loss + take-profit)
+ * Place a buy order with emergency stop-loss only (no take-profit)
+ * Scaled exits from TV alerts handle profit-taking.
+ * This stop-loss is a safety net in case TV alerts fail.
  */
-async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
+async function placeBuyWithStopLoss(ticker, quantity, slPrice) {
     const startTime = Date.now();
 
     const order = {
@@ -259,18 +261,6 @@ async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
             instrument: { symbol: ticker, assetType: 'EQUITY' }
         }],
         childOrderStrategies: [
-            {
-                orderType: 'LIMIT',
-                session: 'NORMAL',
-                duration: 'GOOD_TILL_CANCEL',
-                price: tpPrice.toFixed(2),
-                orderStrategyType: 'SINGLE',
-                orderLegCollection: [{
-                    instruction: 'SELL',
-                    quantity: quantity,
-                    instrument: { symbol: ticker, assetType: 'EQUITY' }
-                }]
-            },
             {
                 orderType: 'STOP',
                 session: 'NORMAL',
@@ -295,14 +285,14 @@ async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
         const latency = Date.now() - startTime;
         const orderId = response.headers.location?.split('/').pop();
 
-        log('ORDER', `BRACKET BUY ${quantity} ${ticker} TP:$${tpPrice.toFixed(2)} SL:$${slPrice.toFixed(2)} | ${latency}ms`);
-        await notify(`BRACKET BUY ${quantity} ${ticker}\nTP: $${tpPrice.toFixed(2)} | SL: $${slPrice.toFixed(2)} | ${latency}ms`, 'buy');
+        log('ORDER', `BUY+SL ${quantity} ${ticker} EmergencySL:$${slPrice.toFixed(2)} | ${latency}ms`);
+        await notify(`BUY ${quantity} ${ticker}\nEmergency SL: $${slPrice.toFixed(2)} | ${latency}ms`, 'buy');
 
         return { success: true, orderId, latency };
     } catch (err) {
         const latency = Date.now() - startTime;
         const errMsg = err.response?.data?.message || err.message;
-        log('ERROR', `BRACKET order failed: ${errMsg} | Latency: ${latency}ms`);
+        log('ERROR', `BUY+SL order failed: ${errMsg} | Latency: ${latency}ms`);
 
         // Fallback: try simple market buy if bracket fails
         log('WARN', 'Falling back to simple market buy...');
@@ -362,7 +352,7 @@ const schwabService = {
     getTokenStatus,
     placeBuyOrder,
     placeSellOrder,
-    placeBracketOrder,
+    placeBuyWithStopLoss,
     getPositions,
     cancelOrdersForTicker
 };
