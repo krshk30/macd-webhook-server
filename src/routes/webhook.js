@@ -12,7 +12,8 @@ const { log } = require('../services/logger');
 const router = express.Router();
 
 const DEFAULT_QTY = () => parseInt(process.env.DEFAULT_QUANTITY || '1000');
-const EMERGENCY_SL_PCT = () => parseFloat(process.env.EMERGENCY_SL_PCT || '5');  // 5% emergency stop
+const EMERGENCY_SL_PCT = () => parseFloat(process.env.EMERGENCY_SL_PCT || '5');
+const DRY_RUN = () => (process.env.DRY_RUN || 'true') === 'true';  // Default ON for safety
 
 router.post('/webhook', async (req, res) => {
     const receiveTime = Date.now();
@@ -81,15 +82,17 @@ async function handleBuy(ticker, price, body) {
     const qty = DEFAULT_QTY();
     const entryPrice = parseFloat(price) || 0;
 
-    // Emergency stop loss only — scaled exits from TV alerts handle profit-taking
-    // This is a safety net in case TV alerts fail, NOT the trading logic
     const emergencySlPrice = entryPrice > 0
         ? entryPrice * (1 - EMERGENCY_SL_PCT() / 100)
         : 0;
 
     let result;
-    if (entryPrice > 0 && emergencySlPrice > 0) {
-        // Place buy with emergency stop-loss attached (no take-profit)
+    if (DRY_RUN()) {
+        // DRY RUN — log what would happen, don't place real orders
+        log('DRY_RUN', `Would BUY ${qty} ${ticker} @ $${entryPrice.toFixed(2)} | EmergencySL: $${emergencySlPrice.toFixed(2)} | Path: ${body.path || '?'}`);
+        await notify(`DRY RUN BUY ${qty} ${ticker} @ $${entryPrice.toFixed(2)}\nPath: ${body.path || '?'} | SL: $${emergencySlPrice.toFixed(2)}`, 'buy');
+        result = { success: true, orderId: 'DRY_RUN', latency: 0 };
+    } else if (entryPrice > 0 && emergencySlPrice > 0) {
         result = await schwabService.placeBuyWithStopLoss(ticker, qty, emergencySlPrice);
     } else {
         result = await schwabService.placeBuyOrder(ticker, qty);
@@ -108,7 +111,8 @@ async function handleBuy(ticker, price, body) {
         emergencySL: emergencySlPrice.toFixed(2),
         orderId: result.orderId,
         schwabLatency: result.latency,
-        path: body.path || 'unknown'
+        path: body.path || 'unknown',
+        dryRun: DRY_RUN()
     };
 }
 
@@ -120,25 +124,29 @@ async function handleScale(ticker, price, body) {
         return { success: false, rejected: 'no position' };
     }
 
-    const level = body.level;    // PCT2, FAST4, PCT4_AFTER2
+    const level = body.level;
     const sellPct = parseInt(body.sell_pct) || 50;
     const currentPrice = parseFloat(price) || 0;
 
-    // Mark milestone
     positions.markMilestone(ticker, level);
 
-    // Calculate and execute scale
     const scaleResult = positions.scalePosition(ticker, sellPct, level, currentPrice);
     if (!scaleResult || scaleResult.sharesToSell <= 0) {
         return { success: false, rejected: 'nothing to sell' };
     }
 
-    // Place sell order
-    const result = await schwabService.placeSellOrder(
-        ticker,
-        scaleResult.sharesToSell,
-        `Scale ${level} (${sellPct}%)`
-    );
+    let result;
+    if (DRY_RUN()) {
+        log('DRY_RUN', `Would SELL ${scaleResult.sharesToSell} ${ticker} @ $${currentPrice.toFixed(2)} | Scale ${level} (${sellPct}%) | P&L: $${scaleResult.pnl.toFixed(2)}`);
+        await notify(`DRY RUN SCALE ${ticker}\nSell ${scaleResult.sharesToSell} shares (${level})\nP&L: $${scaleResult.pnl.toFixed(2)}`, 'sell');
+        result = { success: true, orderId: 'DRY_RUN', latency: 0 };
+    } else {
+        result = await schwabService.placeSellOrder(
+            ticker,
+            scaleResult.sharesToSell,
+            `Scale ${level} (${sellPct}%)`
+        );
+    }
 
     return {
         success: result.success,
@@ -148,7 +156,8 @@ async function handleScale(ticker, price, body) {
         sharesSold: scaleResult.sharesToSell,
         remaining: pos.remainingQuantity,
         scalePnL: scaleResult.pnl.toFixed(2),
-        schwabLatency: result.latency
+        schwabLatency: result.latency,
+        dryRun: DRY_RUN()
     };
 }
 
@@ -163,21 +172,23 @@ async function handleClose(ticker, price, body) {
     const exitPrice = parseFloat(price) || 0;
     const reason = body.reason || 'unknown';
 
-    // Cancel any outstanding bracket orders first
-    await schwabService.cancelOrdersForTicker(ticker);
+    let result;
+    if (DRY_RUN()) {
+        log('DRY_RUN', `Would CLOSE ${pos.remainingQuantity} ${ticker} @ $${exitPrice.toFixed(2)} | Reason: ${reason}`);
+        result = { success: true, orderId: 'DRY_RUN', latency: 0 };
+    } else {
+        await schwabService.cancelOrdersForTicker(ticker);
+        result = await schwabService.placeSellOrder(
+            ticker,
+            pos.remainingQuantity,
+            `Close: ${reason}`
+        );
+    }
 
-    // Sell remaining shares
-    const result = await schwabService.placeSellOrder(
-        ticker,
-        pos.remainingQuantity,
-        `Close: ${reason}`
-    );
-
-    // Close position in tracker
     const summary = positions.closePosition(ticker, exitPrice, reason);
 
     await notify(
-        `CLOSED ${ticker}\n` +
+        `${DRY_RUN() ? 'DRY RUN ' : ''}CLOSED ${ticker}\n` +
         `Entry: $${summary.entryPrice.toFixed(2)} → Exit: $${exitPrice.toFixed(2)}\n` +
         `P&L: $${summary.pnl.toFixed(2)} | ${reason}`,
         summary.pnl >= 0 ? 'profit' : 'loss'
@@ -190,7 +201,8 @@ async function handleClose(ticker, price, body) {
         reason,
         sharesClosed: summary.remainingClosed,
         pnl: summary.pnl.toFixed(2),
-        schwabLatency: result.latency
+        schwabLatency: result.latency,
+        dryRun: DRY_RUN()
     };
 }
 

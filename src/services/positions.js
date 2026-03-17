@@ -16,7 +16,7 @@ let lastResetDate = new Date().toDateString();
 
 // Duplicate alert filter (5-second window)
 const recentAlerts = new Map();
-const DEDUP_WINDOW_MS = 5000;
+const DEDUP_WINDOW_MS = 30000;  // 30 seconds — prevents duplicate orders from alert.freq_all
 
 function resetDailyIfNeeded() {
     const today = new Date().toDateString();

@@ -301,6 +301,21 @@ async function placeBuyWithStopLoss(ticker, quantity, slPrice) {
 }
 
 /**
+ * Get account numbers and hashes from Schwab
+ * Schwab API uses encrypted account hashes, not plain account numbers
+ */
+async function getAccountHash() {
+    try {
+        const response = await api.get('/accounts/accountNumbers');
+        log('INFO', `Account numbers response: ${JSON.stringify(response.data)}`);
+        return response.data;
+    } catch (err) {
+        log('ERROR', `Get account hash failed: ${err.message}`);
+        return null;
+    }
+}
+
+/**
  * Get current positions from Schwab
  */
 async function getPositions() {
@@ -354,6 +369,7 @@ const schwabService = {
     placeSellOrder,
     placeBuyWithStopLoss,
     getPositions,
+    getAccountHash,
     cancelOrdersForTicker
 };
 

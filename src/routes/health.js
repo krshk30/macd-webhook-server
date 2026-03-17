@@ -21,6 +21,7 @@ router.get('/health', (req, res) => {
         },
         trading: positions.getStatus(),
         config: {
+            dryRun: (process.env.DRY_RUN || 'true') === 'true',
             defaultQuantity: process.env.DEFAULT_QUANTITY || '1000',
             emergencySlPct: (process.env.EMERGENCY_SL_PCT || '5') + '%',
             exitStrategy: 'TV scaled exits (2%/4%) + emergency SL safety net',
@@ -34,6 +35,19 @@ router.get('/health', (req, res) => {
 
 router.get('/positions', (req, res) => {
     res.json(positions.getStatus());
+});
+
+// Get Schwab encrypted account hashes
+router.get('/accounts', async (req, res) => {
+    const accounts = await schwabService.getAccountHash();
+    if (accounts) {
+        res.json({
+            message: 'Copy the hashValue for your account and set it as SCHWAB_ACCOUNT_ID in Railway',
+            accounts
+        });
+    } else {
+        res.status(500).json({ error: 'Failed to fetch accounts. Check authentication.' });
+    }
 });
 
 // Simple root response
