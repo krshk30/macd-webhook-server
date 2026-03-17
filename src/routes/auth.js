@@ -1,7 +1,7 @@
 /**
- * Auth Route — Schwab OAuth2 flow
+ * Auth Route — Schwab OAuth2 flow (v1.1)
  * /auth/start → redirects to Schwab login
- * /auth/callback → receives auth code, exchanges for tokens
+ * /auth/callback → receives auth code, exchanges for tokens, auto-fetches account hash
  */
 
 const express = require('express');
@@ -30,21 +30,39 @@ router.get('/callback', async (req, res) => {
     const success = await schwabService.exchangeCodeForTokens(code);
 
     if (success) {
-        // Auto-fetch account hash after successful auth
-        log('AUTH', 'Fetching account hash...');
-        const hashResult = await schwabService.fetchAndStoreAccountHash();
+        // v1.1: Auto-fetch account hash right after getting tokens
+        log('AUTH', 'Tokens obtained, fetching account hash...');
+        const accountHash = await schwabService.fetchAccountHash();
 
-        res.send(`
-            <h2>Authentication Successful</h2>
-            <p>Schwab API tokens obtained. Server is now ready to trade.</p>
-            <p>Token status: ${schwabService.getTokenStatus()}</p>
-            <p>Account hash: ${hashResult ? 'Found and stored automatically' : 'Failed to fetch (will retry on first trade)'}</p>
-            <p><a href="/health">Check health status</a></p>
-            <p><a href="/accounts">View account details</a></p>
-        `);
+        if (accountHash) {
+            res.send(`
+                <h2>✅ Authentication Successful!</h2>
+                <p><strong>Token:</strong> ${schwabService.getTokenStatus()}</p>
+                <p><strong>Account Hash:</strong> ${accountHash.substring(0, 10)}...</p>
+                <p>Your server is now ready to place orders.</p>
+                <hr>
+                <p><a href="/health">Check health status</a></p>
+                <p><a href="/debug/schwab">Run full API diagnostic</a></p>
+            `);
+        } else {
+            res.send(`
+                <h2>⚠️ Authenticated, but account hash failed</h2>
+                <p><strong>Token:</strong> ${schwabService.getTokenStatus()}</p>
+                <p><strong>Account Hash:</strong> FAILED</p>
+                <p>The /accounts/accountNumbers endpoint returned an error.</p>
+                <hr>
+                <h3>Troubleshooting:</h3>
+                <ol>
+                    <li>Visit <a href="/debug/schwab">/debug/schwab</a> to see which endpoints work</li>
+                    <li>Make sure your app is "Ready For Use" on developer.schwab.com</li>
+                    <li>Try re-authenticating — <a href="/auth/start">/auth/start</a></li>
+                    <li>During Schwab login, ensure you CHECK the brokerage account box</li>
+                </ol>
+            `);
+        }
     } else {
         res.status(500).send(`
-            <h2>Authentication Failed</h2>
+            <h2>❌ Authentication Failed</h2>
             <p>Could not exchange authorization code for tokens.</p>
             <p>Check server logs for details.</p>
             <p><a href="/auth/start">Try again</a></p>

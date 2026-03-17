@@ -16,7 +16,7 @@ let lastResetDate = new Date().toDateString();
 
 // Duplicate alert filter (5-second window)
 const recentAlerts = new Map();
-const DEDUP_WINDOW_MS = 30000;  // 30 seconds — prevents duplicate orders from alert.freq_all
+const DEDUP_WINDOW_MS = 5000;
 
 function resetDailyIfNeeded() {
     const today = new Date().toDateString();
@@ -59,24 +59,20 @@ function isWithinTradingHours() {
 function canOpenPosition(ticker) {
     resetDailyIfNeeded();
 
-    // Already holding this ticker
     if (positions.has(ticker)) {
         return { allowed: false, reason: `Already holding ${ticker}` };
     }
 
-    // Max positions
     const maxPos = parseInt(process.env.MAX_POSITIONS || '3');
     if (positions.size >= maxPos) {
         return { allowed: false, reason: `Max positions reached (${positions.size}/${maxPos})` };
     }
 
-    // Daily loss limit
     const maxLoss = parseFloat(process.env.MAX_DAILY_LOSS || '-500');
     if (dailyPnL <= maxLoss) {
         return { allowed: false, reason: `Daily loss limit reached ($${dailyPnL.toFixed(2)})` };
     }
 
-    // Trading hours
     if (!isWithinTradingHours()) {
         return { allowed: false, reason: 'Outside trading hours' };
     }
@@ -124,7 +120,6 @@ function scalePosition(ticker, sellPct, reason, currentPrice) {
         time: new Date().toISOString()
     });
 
-    // Track P&L for this scale
     const scalePnL = (currentPrice - pos.entryPrice) * actualSell;
     dailyPnL += scalePnL;
 

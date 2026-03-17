@@ -1,7 +1,9 @@
 /**
- * MACD Momentum Webhook Server
+ * MACD Momentum Webhook Server v1.1
  * Receives TradingView alerts → places orders via Schwab Trader API
  * Optimized for <500ms end-to-end latency
+ * 
+ * v1.1: Added /debug/schwab endpoint, account hash auto-fetch
  */
 
 require('dotenv').config();
@@ -9,6 +11,7 @@ const express = require('express');
 const { webhookRouter } = require('./routes/webhook');
 const { authRouter } = require('./routes/auth');
 const { healthRouter } = require('./routes/health');
+const { debugRouter } = require('./routes/debug');
 const { schwabService } = require('./services/schwab');
 const { log } = require('./services/logger');
 
@@ -24,6 +27,7 @@ app.set('trust proxy', 1);
 // Routes
 app.use('/', healthRouter);
 app.use('/auth', authRouter);
+app.use('/debug', debugRouter);
 app.use('/', webhookRouter);
 
 // Start server

@@ -1,7 +1,9 @@
 /**
- * Schwab Trader API Service
+ * Schwab Trader API Service v1.1
  * Handles OAuth2 authentication, token refresh, and order placement
  * Pre-authenticated tokens + HTTP keep-alive for minimum latency
+ * 
+ * v1.1: Added account hash auto-fetch, debug helpers
  */
 
 const axios = require('axios');
@@ -13,7 +15,6 @@ const SCHWAB_TOKEN_URL = 'https://api.schwabapi.com/v1/oauth/token';
 const SCHWAB_API_BASE = 'https://api.schwabapi.com/trader/v1';
 
 // Persistent HTTP agent for keep-alive connections (saves ~80ms per request)
-const http = require('http');
 const https = require('https');
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
@@ -25,13 +26,17 @@ let tokens = {
     token_type: 'Bearer'
 };
 
+// Account hash — required for all account/order API calls
+// This is NOT the same as your raw account number
+let accountHash = null;
+
 let refreshTimer = null;
 
 // ─── Axios instance with keep-alive ────────────────────────────
 const api = axios.create({
     baseURL: SCHWAB_API_BASE,
     httpsAgent: keepAliveAgent,
-    timeout: 5000,  // 5s timeout — fail fast
+    timeout: 5000,
     headers: { 'Content-Type': 'application/json' }
 });
 
@@ -59,7 +64,7 @@ async function exchangeCodeForTokens(authCode) {
     const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
     try {
-        const response = await axios.post(SCHWAB_TOKEN_URL, 
+        const response = await axios.post(SCHWAB_TOKEN_URL,
             new URLSearchParams({
                 grant_type: 'authorization_code',
                 code: authCode,
@@ -115,7 +120,6 @@ async function refreshAccessToken() {
 
         tokens.access_token = response.data.access_token;
         tokens.expires_at = Date.now() + (response.data.expires_in * 1000);
-        // Schwab may return a new refresh token
         if (response.data.refresh_token) {
             tokens.refresh_token = response.data.refresh_token;
         }
@@ -152,66 +156,49 @@ function getTokenStatus() {
     return `valid (${minsLeft}m remaining)`;
 }
 
+// ─── Account Hash Functions (v1.1) ─────────────────────────────
+
+function getAccessToken() {
+    return tokens.access_token;
+}
+
+function setAccountHash(hash) {
+    accountHash = hash;
+    log('INFO', `Account hash stored: ${hash.substring(0, 10)}...`);
+}
+
+function getAccountHash() {
+    return accountHash;
+}
+
+async function fetchAccountHash() {
+    if (!tokens.access_token) return null;
+
+    try {
+        const response = await api.get('/accounts/accountNumbers');
+        if (response.data && Array.isArray(response.data) && response.data.length > 0) {
+            accountHash = response.data[0].hashValue;
+            log('INFO', `Account hash fetched: ${response.data[0].accountNumber} → ${accountHash.substring(0, 10)}...`);
+            return accountHash;
+        } else {
+            log('ERROR', 'No accounts returned from accountNumbers endpoint');
+            return null;
+        }
+    } catch (err) {
+        log('ERROR', `Failed to fetch account hash: ${err.response?.status} — ${err.response?.data?.message || err.message}`);
+        return null;
+    }
+}
+
+// Helper: get account identifier for API calls
+// Uses account hash (preferred) or falls back to raw account ID
+function getAccountId() {
+    if (accountHash) return accountHash;
+    return process.env.SCHWAB_ACCOUNT_HASH || process.env.SCHWAB_ACCOUNT_ID;
+}
+
 // ─── Order Placement ───────────────────────────────────────────
 
-// Account hash storage — Schwab API requires encrypted hash, not plain account number
-let storedAccountHash = null;
-
-const accountId = () => storedAccountHash || process.env.SCHWAB_ACCOUNT_ID;
-
-/**
- * Fetch account hash from Schwab and store it
- * Schwab API uses encrypted hashes, not plain account numbers
- * Retries up to 3 times with delay (Schwab 500 errors are intermittent)
- */
-async function fetchAndStoreAccountHash() {
-    const targetAccount = process.env.SCHWAB_ACCOUNT_ID;
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-            log('INFO', `Fetching account hash (attempt ${attempt}/3)...`);
-            const response = await api.get('/accounts/accountNumbers');
-            const accounts = response.data;
-
-            log('INFO', `Found ${accounts.length} account(s): ${JSON.stringify(accounts)}`);
-
-            if (accounts && accounts.length > 0) {
-                // Try to match by account number
-                const match = accounts.find(a =>
-                    a.accountNumber === targetAccount ||
-                    a.accountNumber.endsWith(targetAccount) ||
-                    targetAccount.endsWith(a.accountNumber)
-                );
-
-                if (match) {
-                    storedAccountHash = match.hashValue;
-                    log('INFO', `Account hash found for ...${targetAccount.slice(-4)}: ${storedAccountHash.substring(0, 8)}...`);
-                } else {
-                    // Just use the first account
-                    storedAccountHash = accounts[0].hashValue;
-                    log('INFO', `Using first account hash: ${storedAccountHash.substring(0, 8)}... (account: ${accounts[0].accountNumber})`);
-                }
-                return storedAccountHash;
-            }
-        } catch (err) {
-            log('WARN', `Account hash fetch attempt ${attempt} failed: ${err.response?.status} ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`);
-            if (attempt < 3) {
-                await new Promise(r => setTimeout(r, 2000 * attempt));  // Wait 2s, 4s between retries
-            }
-        }
-    }
-
-    log('ERROR', 'Could not fetch account hash after 3 attempts. Will use SCHWAB_ACCOUNT_ID as-is.');
-    return null;
-}
-
-function getStoredAccountHash() {
-    return storedAccountHash;
-}
-
-/**
- * Place a market buy order with optional bracket (TP/SL)
- */
 async function placeBuyOrder(ticker, quantity) {
     const startTime = Date.now();
 
@@ -223,39 +210,26 @@ async function placeBuyOrder(ticker, quantity) {
         orderLegCollection: [{
             instruction: 'BUY',
             quantity: quantity,
-            instrument: {
-                symbol: ticker,
-                assetType: 'EQUITY'
-            }
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
         }]
     };
 
     try {
-        const response = await api.post(
-            `/accounts/${accountId()}/orders`,
-            order
-        );
-
+        const response = await api.post(`/accounts/${getAccountId()}/orders`, order);
         const latency = Date.now() - startTime;
         const orderId = response.headers.location?.split('/').pop();
-
-        log('ORDER', `BUY ${quantity} ${ticker} | Order ID: ${orderId} | Latency: ${latency}ms`);
-        await notify(`BUY ${quantity} ${ticker} @ market | ${latency}ms`, 'buy');
-
+        log('ORDER', `BUY ${quantity} ${ticker} | ${latency}ms | Order: ${orderId}`);
+        await notify(`BUY ${quantity} ${ticker} | ${latency}ms`, 'buy');
         return { success: true, orderId, latency };
     } catch (err) {
         const latency = Date.now() - startTime;
         const errMsg = err.response?.data?.message || err.message;
-        log('ERROR', `BUY order failed: ${errMsg} | Latency: ${latency}ms`);
-        await notify(`BUY FAILED: ${ticker} — ${errMsg}`, 'error');
+        log('ERROR', `BUY order failed: ${errMsg} | ${latency}ms`);
         return { success: false, error: errMsg, latency };
     }
 }
 
-/**
- * Place a market sell order (for scaling out or closing)
- */
-async function placeSellOrder(ticker, quantity, reason) {
+async function placeSellOrder(ticker, quantity, reason = '') {
     const startTime = Date.now();
 
     const order = {
@@ -266,41 +240,26 @@ async function placeSellOrder(ticker, quantity, reason) {
         orderLegCollection: [{
             instruction: 'SELL',
             quantity: quantity,
-            instrument: {
-                symbol: ticker,
-                assetType: 'EQUITY'
-            }
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
         }]
     };
 
     try {
-        const response = await api.post(
-            `/accounts/${accountId()}/orders`,
-            order
-        );
-
+        const response = await api.post(`/accounts/${getAccountId()}/orders`, order);
         const latency = Date.now() - startTime;
         const orderId = response.headers.location?.split('/').pop();
-
-        log('ORDER', `SELL ${quantity} ${ticker} (${reason}) | Order ID: ${orderId} | Latency: ${latency}ms`);
+        log('ORDER', `SELL ${quantity} ${ticker} (${reason}) | ${latency}ms | Order: ${orderId}`);
         await notify(`SELL ${quantity} ${ticker} (${reason}) | ${latency}ms`, 'sell');
-
         return { success: true, orderId, latency };
     } catch (err) {
         const latency = Date.now() - startTime;
         const errMsg = err.response?.data?.message || err.message;
-        log('ERROR', `SELL order failed: ${errMsg} | Latency: ${latency}ms`);
-        await notify(`SELL FAILED: ${ticker} — ${errMsg}`, 'error');
+        log('ERROR', `SELL order failed: ${errMsg} | ${latency}ms`);
         return { success: false, error: errMsg, latency };
     }
 }
 
-/**
- * Place a buy order with emergency stop-loss only (no take-profit)
- * Scaled exits from TV alerts handle profit-taking.
- * This stop-loss is a safety net in case TV alerts fail.
- */
-async function placeBuyWithStopLoss(ticker, quantity, slPrice) {
+async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
     const startTime = Date.now();
 
     const order = {
@@ -315,9 +274,21 @@ async function placeBuyWithStopLoss(ticker, quantity, slPrice) {
         }],
         childOrderStrategies: [
             {
+                orderType: 'LIMIT',
+                session: 'NORMAL',
+                duration: 'DAY',
+                price: tpPrice.toFixed(2),
+                orderStrategyType: 'SINGLE',
+                orderLegCollection: [{
+                    instruction: 'SELL',
+                    quantity: quantity,
+                    instrument: { symbol: ticker, assetType: 'EQUITY' }
+                }]
+            },
+            {
                 orderType: 'STOP',
                 session: 'NORMAL',
-                duration: 'GOOD_TILL_CANCEL',
+                duration: 'DAY',
                 stopPrice: slPrice.toFixed(2),
                 orderStrategyType: 'SINGLE',
                 orderLegCollection: [{
@@ -330,61 +301,24 @@ async function placeBuyWithStopLoss(ticker, quantity, slPrice) {
     };
 
     try {
-        const response = await api.post(
-            `/accounts/${accountId()}/orders`,
-            order
-        );
-
+        const response = await api.post(`/accounts/${getAccountId()}/orders`, order);
         const latency = Date.now() - startTime;
         const orderId = response.headers.location?.split('/').pop();
-
-        log('ORDER', `BUY+SL ${quantity} ${ticker} EmergencySL:$${slPrice.toFixed(2)} | ${latency}ms`);
-        await notify(`BUY ${quantity} ${ticker}\nEmergency SL: $${slPrice.toFixed(2)} | ${latency}ms`, 'buy');
-
+        log('ORDER', `BRACKET BUY ${quantity} ${ticker} TP:$${tpPrice.toFixed(2)} SL:$${slPrice.toFixed(2)} | ${latency}ms`);
+        await notify(`BRACKET BUY ${quantity} ${ticker}\nTP: $${tpPrice.toFixed(2)} | SL: $${slPrice.toFixed(2)} | ${latency}ms`, 'buy');
         return { success: true, orderId, latency };
     } catch (err) {
         const latency = Date.now() - startTime;
         const errMsg = err.response?.data?.message || err.message;
-        log('ERROR', `BUY+SL order failed: ${errMsg} | Latency: ${latency}ms`);
-
-        // Fallback: try simple market buy if bracket fails
+        log('ERROR', `BRACKET order failed: ${errMsg} | Latency: ${latency}ms`);
         log('WARN', 'Falling back to simple market buy...');
         return await placeBuyOrder(ticker, quantity);
     }
 }
 
-/**
- * Get account numbers and hashes from Schwab
- * Schwab API uses encrypted account hashes, not plain account numbers
- */
-async function getAccountHash() {
-    // Try endpoint 1: /accounts/accountNumbers
-    try {
-        const response = await api.get('/accounts/accountNumbers');
-        log('INFO', `Account numbers response: ${JSON.stringify(response.data)}`);
-        return { source: 'accountNumbers', data: response.data };
-    } catch (err1) {
-        log('WARN', `accountNumbers endpoint failed: ${err1.response?.status} ${err1.response?.data ? JSON.stringify(err1.response.data) : err1.message}`);
-    }
-
-    // Try endpoint 2: /accounts (list all accounts — hash is in the URL/keys)
-    try {
-        const response = await api.get('/accounts');
-        log('INFO', `Accounts response: ${JSON.stringify(response.data)}`);
-        return { source: 'accounts', data: response.data };
-    } catch (err2) {
-        log('WARN', `accounts endpoint failed: ${err2.response?.status} ${err2.response?.data ? JSON.stringify(err2.response.data) : err2.message}`);
-    }
-
-    return null;
-}
-
-/**
- * Get current positions from Schwab
- */
 async function getPositions() {
     try {
-        const response = await api.get(`/accounts/${accountId()}?fields=positions`);
+        const response = await api.get(`/accounts/${getAccountId()}?fields=positions`);
         return response.data?.securitiesAccount?.positions || [];
     } catch (err) {
         log('ERROR', `Get positions failed: ${err.message}`);
@@ -392,12 +326,9 @@ async function getPositions() {
     }
 }
 
-/**
- * Cancel all open orders for a ticker
- */
 async function cancelOrdersForTicker(ticker) {
     try {
-        const response = await api.get(`/accounts/${accountId()}/orders`, {
+        const response = await api.get(`/accounts/${getAccountId()}/orders`, {
             params: { status: 'QUEUED' }
         });
 
@@ -407,7 +338,7 @@ async function cancelOrdersForTicker(ticker) {
         for (const order of orders) {
             const leg = order.orderLegCollection?.[0];
             if (leg?.instrument?.symbol === ticker) {
-                await api.delete(`/accounts/${accountId()}/orders/${order.orderId}`);
+                await api.delete(`/accounts/${getAccountId()}/orders/${order.orderId}`);
                 cancelled++;
             }
         }
@@ -422,6 +353,8 @@ async function cancelOrdersForTicker(ticker) {
     }
 }
 
+// ─── Module Exports ────────────────────────────────────────────
+
 const schwabService = {
     getAuthUrl,
     exchangeCodeForTokens,
@@ -431,12 +364,15 @@ const schwabService = {
     getTokenStatus,
     placeBuyOrder,
     placeSellOrder,
-    placeBuyWithStopLoss,
+    placeBracketOrder,
     getPositions,
+    cancelOrdersForTicker,
+    // v1.1 additions
+    getAccessToken,
+    setAccountHash,
     getAccountHash,
-    fetchAndStoreAccountHash,
-    getStoredAccountHash,
-    cancelOrdersForTicker
+    fetchAccountHash,
+    getAccountId
 };
 
 module.exports = { schwabService };
