@@ -39,14 +39,18 @@ router.get('/positions', (req, res) => {
 
 // Get Schwab encrypted account hashes
 router.get('/accounts', async (req, res) => {
-    const accounts = await schwabService.getAccountHash();
-    if (accounts) {
+    const result = await schwabService.getAccountHash();
+    if (result) {
         res.json({
-            message: 'Copy the hashValue for your account and set it as SCHWAB_ACCOUNT_ID in Railway',
-            accounts
+            message: 'Find your account hashValue below. Set it as SCHWAB_ACCOUNT_ID in Railway.',
+            source: result.source,
+            data: result.data
         });
     } else {
-        res.status(500).json({ error: 'Failed to fetch accounts. Check authentication.' });
+        res.status(500).json({ 
+            error: 'Failed to fetch accounts. Check Railway deploy logs for details.',
+            hint: 'Make sure you visited /auth/start first and token is valid.'
+        });
     }
 });
 

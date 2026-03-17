@@ -305,14 +305,25 @@ async function placeBuyWithStopLoss(ticker, quantity, slPrice) {
  * Schwab API uses encrypted account hashes, not plain account numbers
  */
 async function getAccountHash() {
+    // Try endpoint 1: /accounts/accountNumbers
     try {
         const response = await api.get('/accounts/accountNumbers');
         log('INFO', `Account numbers response: ${JSON.stringify(response.data)}`);
-        return response.data;
-    } catch (err) {
-        log('ERROR', `Get account hash failed: ${err.message}`);
-        return null;
+        return { source: 'accountNumbers', data: response.data };
+    } catch (err1) {
+        log('WARN', `accountNumbers endpoint failed: ${err1.response?.status} ${err1.response?.data ? JSON.stringify(err1.response.data) : err1.message}`);
     }
+
+    // Try endpoint 2: /accounts (list all accounts — hash is in the URL/keys)
+    try {
+        const response = await api.get('/accounts');
+        log('INFO', `Accounts response: ${JSON.stringify(response.data)}`);
+        return { source: 'accounts', data: response.data };
+    } catch (err2) {
+        log('WARN', `accounts endpoint failed: ${err2.response?.status} ${err2.response?.data ? JSON.stringify(err2.response.data) : err2.message}`);
+    }
+
+    return null;
 }
 
 /**
