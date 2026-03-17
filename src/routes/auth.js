@@ -1,7 +1,6 @@
 /**
- * Auth Route — Schwab OAuth2 flow (v1.1)
- * /auth/start → redirects to Schwab login
- * /auth/callback → receives auth code, exchanges for tokens, auto-fetches account hash
+ * Auth Route — Schwab OAuth2 flow v1.2.1
+ * Adds 3-second delay before account hash fetch (fixes 400 on fresh tokens)
  */
 
 const express = require('express');
@@ -10,14 +9,12 @@ const { log } = require('../services/logger');
 
 const router = express.Router();
 
-// Step 1: Redirect user to Schwab login
 router.get('/start', (req, res) => {
     const authUrl = schwabService.getAuthUrl();
     log('AUTH', 'Redirecting to Schwab OAuth login...');
     res.redirect(authUrl);
 });
 
-// Step 2: Schwab redirects back with auth code
 router.get('/callback', async (req, res) => {
     const code = req.query.code;
 
@@ -30,8 +27,10 @@ router.get('/callback', async (req, res) => {
     const success = await schwabService.exchangeCodeForTokens(code);
 
     if (success) {
-        // v1.1: Auto-fetch account hash right after getting tokens
-        log('AUTH', 'Tokens obtained, fetching account hash...');
+        // Wait 3 seconds — Schwab needs time to activate fresh tokens
+        log('AUTH', 'Tokens obtained, waiting 3s before fetching account hash...');
+        await new Promise(r => setTimeout(r, 3000));
+
         const accountHash = await schwabService.fetchAccountHash();
 
         if (accountHash) {
@@ -48,23 +47,21 @@ router.get('/callback', async (req, res) => {
             res.send(`
                 <h2>⚠️ Authenticated, but account hash failed</h2>
                 <p><strong>Token:</strong> ${schwabService.getTokenStatus()}</p>
-                <p><strong>Account Hash:</strong> FAILED</p>
-                <p>The /accounts/accountNumbers endpoint returned an error.</p>
+                <p><strong>Account Hash:</strong> FAILED — will retry automatically</p>
+                <p>Click <a href="/debug/schwab">/debug/schwab</a> to fetch it now (usually works on second try).</p>
                 <hr>
-                <h3>Troubleshooting:</h3>
+                <h3>If /debug/schwab also fails:</h3>
                 <ol>
-                    <li>Visit <a href="/debug/schwab">/debug/schwab</a> to see which endpoints work</li>
-                    <li>Make sure your app is "Ready For Use" on developer.schwab.com</li>
+                    <li>Make sure app is "Ready For Use" on developer.schwab.com</li>
                     <li>Try re-authenticating — <a href="/auth/start">/auth/start</a></li>
-                    <li>During Schwab login, ensure you CHECK the brokerage account box</li>
+                    <li>During Schwab login, CHECK the brokerage account box</li>
                 </ol>
             `);
         }
     } else {
         res.status(500).send(`
             <h2>❌ Authentication Failed</h2>
-            <p>Could not exchange authorization code for tokens.</p>
-            <p>Check server logs for details.</p>
+            <p>Could not exchange authorization code for tokens. Check server logs.</p>
             <p><a href="/auth/start">Try again</a></p>
         `);
     }

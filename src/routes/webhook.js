@@ -1,6 +1,6 @@
 /**
- * Webhook Route — receives TradingView alerts
- * Every millisecond matters: validate fast, execute fast, respond fast
+ * Webhook Route — receives TradingView alerts v1.2.1
+ * Passes price to all order functions for extended hours LIMIT orders
  */
 
 const express = require('express');
@@ -19,13 +19,11 @@ router.post('/webhook', async (req, res) => {
     const receiveTime = Date.now();
     const body = req.body;
 
-    // ─── Step 1: Validate token (< 1ms) ─────────────────────────
     if (body.token !== process.env.WEBHOOK_TOKEN) {
         log('WARN', `Unauthorized webhook attempt from ${req.ip}`);
         return res.status(401).json({ error: 'unauthorized' });
     }
 
-    // ─── Step 2: Check auth (< 1ms) ─────────────────────────────
     if (!schwabService.isAuthenticated()) {
         log('ERROR', 'Schwab not authenticated — order rejected');
         return res.status(503).json({ error: 'not_authenticated' });
@@ -38,12 +36,10 @@ router.post('/webhook', async (req, res) => {
 
     log('WEBHOOK', `Received: ${action} ${ticker} @ $${price || '?'} | Processing...`);
 
-    // ─── Step 3: Dedup check (< 1ms) ────────────────────────────
     if (positions.isDuplicate(ticker, action)) {
         return res.json({ status: 'duplicate_filtered', latency: Date.now() - receiveTime });
     }
 
-    // ─── Step 4: Execute based on action ────────────────────────
     let result;
 
     try {
@@ -67,11 +63,9 @@ router.post('/webhook', async (req, res) => {
 
     const totalLatency = Date.now() - receiveTime;
     log('WEBHOOK', `Completed: ${action} ${ticker} | Server latency: ${totalLatency}ms`);
-
     res.json({ ...result, serverLatency: totalLatency });
 });
 
-// ─── BUY Handler ────────────────────────────────────────────────
 async function handleBuy(ticker, price, body) {
     const check = positions.canOpenPosition(ticker);
     if (!check.allowed) {
@@ -105,11 +99,11 @@ async function handleBuy(ticker, price, body) {
         sl: slPrice.toFixed(2),
         orderId: result.orderId,
         schwabLatency: result.latency,
+        session: schwabService.getSessionType(),
         path: body.path || 'unknown'
     };
 }
 
-// ─── SCALE Handler ──────────────────────────────────────────────
 async function handleScale(ticker, price, body) {
     const pos = positions.getPosition(ticker);
     if (!pos) {
@@ -138,8 +132,7 @@ async function handleScale(ticker, price, body) {
     return {
         success: result.success,
         action: 'SCALE',
-        ticker,
-        level,
+        ticker, level,
         sharesSold: scaleResult.sharesToSell,
         remaining: pos.remainingQuantity,
         scalePnL: scaleResult.pnl.toFixed(2),
@@ -147,7 +140,6 @@ async function handleScale(ticker, price, body) {
     };
 }
 
-// ─── CLOSE Handler ──────────────────────────────────────────────
 async function handleClose(ticker, price, body) {
     const pos = positions.getPosition(ticker);
     if (!pos) {
@@ -179,8 +171,7 @@ async function handleClose(ticker, price, body) {
     return {
         success: result.success,
         action: 'CLOSE',
-        ticker,
-        reason,
+        ticker, reason,
         sharesClosed: summary.remainingClosed,
         pnl: summary.pnl.toFixed(2),
         schwabLatency: result.latency

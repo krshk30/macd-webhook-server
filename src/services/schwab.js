@@ -1,11 +1,12 @@
 /**
- * Schwab Trader API Service v1.2
- * 
- * v1.2 CHANGES:
- *   - Extended hours: auto-detects pre/post market, uses LIMIT + SEAMLESS session
- *   - Orphan position safety: periodic sync checks for positions without matching tracker
- *   - TP/SL controlled by env vars (TP_CENTS, SL_CENTS)
- *   - Emergency stop: auto-closes orphan positions after configurable timeout
+ * Schwab Trader API Service v1.2.1
+ *
+ * CHANGELOG:
+ *   v1.0: OAuth2, token refresh, order placement
+ *   v1.1: Account hash auto-fetch, /debug/schwab endpoint
+ *   v1.2: Extended hours LIMIT orders, orphan position safety net
+ *   v1.2.1: Fixed orphan check 400 error (proper query params),
+ *           fetchAccountHash retry with delay, better error logging
  */
 
 const axios = require('axios');
@@ -30,7 +31,7 @@ let accountHash = null;
 let refreshTimer = null;
 let orphanCheckTimer = null;
 
-// ─── Axios instance with keep-alive ────────────────────────────
+// ─── Axios instance ────────────────────────────────────────────
 const api = axios.create({
     baseURL: SCHWAB_API_BASE,
     httpsAgent: keepAliveAgent,
@@ -54,11 +55,8 @@ function getEasternTime() {
 
 function isRegularHours() {
     const et = getEasternTime();
-    const hour = et.getHours();
-    const min = et.getMinutes();
-    const totalMins = hour * 60 + min;
-    // Regular market: 9:30 AM - 4:00 PM ET
-    return totalMins >= 570 && totalMins < 960;
+    const totalMins = et.getHours() * 60 + et.getMinutes();
+    return totalMins >= 570 && totalMins < 960; // 9:30 AM - 4:00 PM ET
 }
 
 function getSessionType() {
@@ -66,12 +64,9 @@ function getSessionType() {
 }
 
 function getOrderType(requestedType, price) {
-    if (isRegularHours()) {
-        return requestedType; // MARKET is fine during regular hours
-    }
-    // Pre/post market: MUST use LIMIT orders
+    if (isRegularHours()) return requestedType;
     if (requestedType === 'MARKET' && price && price > 0) {
-        log('ORDER', `Extended hours detected — converting MARKET → LIMIT @ $${price.toFixed(2)}`);
+        log('ORDER', `Extended hours — converting MARKET → LIMIT @ $${price.toFixed(2)}`);
         return 'LIMIT';
     }
     return requestedType;
@@ -123,7 +118,7 @@ async function exchangeCodeForTokens(authCode) {
 
 async function refreshAccessToken() {
     if (!tokens.refresh_token) {
-        log('WARN', 'No refresh token available — re-authentication required');
+        log('WARN', 'No refresh token — re-authentication required');
         return false;
     }
 
@@ -181,7 +176,7 @@ function getTokenStatus() {
     return `valid (${minsLeft}m remaining)`;
 }
 
-// ─── Account Hash Functions ────────────────────────────────────
+// ─── Account Hash ──────────────────────────────────────────────
 
 function getAccessToken() { return tokens.access_token; }
 function setAccountHash(hash) { accountHash = hash; log('INFO', `Account hash stored: ${hash.substring(0, 10)}...`); }
@@ -189,16 +184,25 @@ function getAccountHash() { return accountHash; }
 
 async function fetchAccountHash() {
     if (!tokens.access_token) return null;
-    try {
-        const response = await api.get('/accounts/accountNumbers');
-        if (response.data && Array.isArray(response.data) && response.data.length > 0) {
-            accountHash = response.data[0].hashValue;
-            log('INFO', `Account hash fetched: ${response.data[0].accountNumber} → ${accountHash.substring(0, 10)}...`);
-            return accountHash;
+
+    // Try twice — fresh tokens sometimes need a moment
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const response = await api.get('/accounts/accountNumbers');
+            if (response.data && Array.isArray(response.data) && response.data.length > 0) {
+                accountHash = response.data[0].hashValue;
+                log('INFO', `Account hash fetched: ${response.data[0].accountNumber} → ${accountHash.substring(0, 10)}...`);
+                return accountHash;
+            }
+        } catch (err) {
+            log('WARN', `Account hash attempt ${attempt} failed (${err.response?.status || 'error'})`);
+            if (attempt < 2) {
+                log('INFO', 'Retrying in 3 seconds...');
+                await new Promise(r => setTimeout(r, 3000));
+            }
         }
-    } catch (err) {
-        log('ERROR', `Failed to fetch account hash: ${err.response?.status} — ${err.response?.data?.message || err.message}`);
     }
+    log('ERROR', 'Account hash failed after retries — use /debug/schwab to retry');
     return null;
 }
 
@@ -209,11 +213,6 @@ function getAccountId() {
 
 // ─── Order Placement ───────────────────────────────────────────
 
-/**
- * Place a buy order — auto-detects regular vs extended hours
- * Regular hours: MARKET order, NORMAL session
- * Extended hours: LIMIT order at current price, SEAMLESS session
- */
 async function placeBuyOrder(ticker, quantity, price) {
     const startTime = Date.now();
     const session = getSessionType();
@@ -231,7 +230,6 @@ async function placeBuyOrder(ticker, quantity, price) {
         }]
     };
 
-    // Add price for LIMIT orders (extended hours)
     if (orderType === 'LIMIT' && price > 0) {
         order.price = price.toFixed(2);
     }
@@ -246,15 +244,12 @@ async function placeBuyOrder(ticker, quantity, price) {
     } catch (err) {
         const latency = Date.now() - startTime;
         const errMsg = err.response?.data?.message || err.message;
-        log('ERROR', `BUY order failed: ${errMsg} | ${latency}ms`);
+        log('ERROR', `BUY failed: ${errMsg} | ${latency}ms`);
         return { success: false, error: errMsg, latency };
     }
 }
 
-/**
- * Place a sell order — auto-detects session type
- */
-async function placeSellOrder(ticker, quantity, reason = '', price) {
+async function placeSellOrder(ticker, quantity, reason, price) {
     const startTime = Date.now();
     const session = getSessionType();
     const orderType = getOrderType('MARKET', price);
@@ -285,21 +280,14 @@ async function placeSellOrder(ticker, quantity, reason = '', price) {
     } catch (err) {
         const latency = Date.now() - startTime;
         const errMsg = err.response?.data?.message || err.message;
-        log('ERROR', `SELL order failed: ${errMsg} | ${latency}ms`);
+        log('ERROR', `SELL failed: ${errMsg} | ${latency}ms`);
         return { success: false, error: errMsg, latency };
     }
 }
 
-/**
- * Place a bracket order: buy + take profit + stop loss
- * TP/SL controlled by TP_CENTS and SL_CENTS env vars
- * Extended hours: uses LIMIT + SEAMLESS for the entry
- */
 async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
     const startTime = Date.now();
     const session = getSessionType();
-
-    // Entry order — LIMIT for extended hours, MARKET for regular
     const entryType = isRegularHours() ? 'MARKET' : 'LIMIT';
 
     const order = {
@@ -340,9 +328,7 @@ async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
         ]
     };
 
-    // For extended hours LIMIT entry, add price
     if (entryType === 'LIMIT') {
-        // Use midpoint between TP and SL as entry price (close to current)
         const entryPrice = (tpPrice + slPrice) / 2;
         order.price = entryPrice.toFixed(2);
         log('ORDER', `Extended hours: LIMIT entry @ $${entryPrice.toFixed(2)}`);
@@ -357,25 +343,25 @@ async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
         return { success: true, orderId, latency };
     } catch (err) {
         const latency = Date.now() - startTime;
-        const errMsg = err.response?.data?.message || err.message;
-        log('ERROR', `BRACKET order failed: ${errMsg} | ${latency}ms`);
+        log('ERROR', `BRACKET failed: ${err.response?.data?.message || err.message} | ${latency}ms`);
         log('WARN', 'Falling back to simple buy...');
         return await placeBuyOrder(ticker, quantity, (tpPrice + slPrice) / 2);
     }
 }
 
-// ─── Position Sync (Orphan Safety Net) ─────────────────────────
+// ─── Orphan Position Safety Net ────────────────────────────────
 
-/**
- * Checks Schwab for real positions that the server doesn't know about.
- * This catches the "repainting" scenario where TV fires BUY, Schwab fills it,
- * then TV's signal disappears — leaving an orphan position with no exit.
- */
 async function checkOrphanPositions(positionsTracker) {
     if (!isAuthenticated()) return;
+    if (!accountHash) {
+        log('DEBUG', 'Orphan check skipped — no account hash yet');
+        return;
+    }
 
     try {
-        const response = await api.get(`/accounts/${getAccountId()}?fields=positions`);
+        const response = await api.get(`/accounts/${getAccountId()}`, {
+            params: { fields: 'positions' }
+        });
         const schwabPositions = response.data?.securitiesAccount?.positions || [];
 
         for (const pos of schwabPositions) {
@@ -384,38 +370,30 @@ async function checkOrphanPositions(positionsTracker) {
 
             if (!symbol || qty <= 0) continue;
 
-            // Check if our tracker knows about this position
             const tracked = positionsTracker.getPosition(symbol);
 
             if (!tracked) {
-                // ORPHAN DETECTED — position exists on Schwab but not in our tracker
                 const avgPrice = pos.averagePrice || 0;
-                const currentPrice = pos.currentDayProfitLossPercentage != null
-                    ? avgPrice * (1 + pos.currentDayProfitLossPercentage / 100)
-                    : avgPrice;
 
-                log('WARN', `⚠️ ORPHAN POSITION: ${symbol} x${qty} @ $${avgPrice.toFixed(2)} — not tracked by server`);
+                log('WARN', `ORPHAN POSITION: ${symbol} x${qty} @ $${avgPrice.toFixed(2)} — not tracked`);
                 await notify(
                     `⚠️ ORPHAN DETECTED: ${symbol} x${qty} @ $${avgPrice.toFixed(2)}\n` +
-                    `This position exists on Schwab but has no matching signal tracker.\n` +
-                    `Possible repainting or missed EXIT signal.\n` +
-                    `Server will auto-close in ${process.env.ORPHAN_TIMEOUT_MINS || 5} minutes if not resolved.`,
+                    `Position on Schwab but no matching signal tracker.\n` +
+                    `Auto-close in ${process.env.ORPHAN_TIMEOUT_MINS || 5} mins if not resolved.`,
                     'error'
                 );
 
-                // Auto-register it so we can track and eventually close it
                 positionsTracker.openPosition(symbol, avgPrice, qty);
                 positionsTracker.markOrphan(symbol);
             }
         }
     } catch (err) {
-        log('ERROR', `Orphan check failed: ${err.message}`);
+        const status = err.response?.status || 'unknown';
+        const detail = err.response?.data?.message || err.response?.data?.error || err.message;
+        log('WARN', `Orphan check failed (${status}): ${detail}`);
     }
 }
 
-/**
- * Close orphan positions that have been untracked for too long
- */
 async function closeOrphanPositions(positionsTracker) {
     if (!isAuthenticated()) return;
 
@@ -425,19 +403,18 @@ async function closeOrphanPositions(positionsTracker) {
     for (const orphan of orphans) {
         log('WARN', `Auto-closing orphan: ${orphan.ticker} x${orphan.remainingQuantity}`);
 
-        const currentPrice = orphan.entryPrice; // best we have
         const result = await placeSellOrder(
             orphan.ticker,
             orphan.remainingQuantity,
             'ORPHAN_AUTO_CLOSE',
-            currentPrice
+            orphan.entryPrice
         );
 
         if (result.success) {
-            positionsTracker.closePosition(orphan.ticker, currentPrice, 'ORPHAN_AUTO_CLOSE');
+            positionsTracker.closePosition(orphan.ticker, orphan.entryPrice, 'ORPHAN_AUTO_CLOSE');
             await notify(
                 `🔴 AUTO-CLOSED ORPHAN: ${orphan.ticker} x${orphan.remainingQuantity}\n` +
-                `Reason: No exit signal received within ${timeoutMins} minutes.`,
+                `No exit signal received within ${timeoutMins} minutes.`,
                 'error'
             );
         }
@@ -446,21 +423,20 @@ async function closeOrphanPositions(positionsTracker) {
 
 function startOrphanCheck(positionsTracker) {
     if (orphanCheckTimer) clearInterval(orphanCheckTimer);
-
-    // Check every 2 minutes
     orphanCheckTimer = setInterval(async () => {
         await checkOrphanPositions(positionsTracker);
         await closeOrphanPositions(positionsTracker);
     }, 2 * 60 * 1000);
-
     log('INFO', 'Orphan position checker started (every 2 min)');
 }
 
-// ─── Existing helper functions ─────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────
 
 async function getPositions() {
     try {
-        const response = await api.get(`/accounts/${getAccountId()}?fields=positions`);
+        const response = await api.get(`/accounts/${getAccountId()}`, {
+            params: { fields: 'positions' }
+        });
         return response.data?.securitiesAccount?.positions || [];
     } catch (err) {
         log('ERROR', `Get positions failed: ${err.message}`);
@@ -493,28 +469,14 @@ async function cancelOrdersForTicker(ticker) {
 // ─── Module Exports ────────────────────────────────────────────
 
 const schwabService = {
-    getAuthUrl,
-    exchangeCodeForTokens,
-    refreshAccessToken,
-    startTokenRefresh,
-    isAuthenticated,
-    getTokenStatus,
-    placeBuyOrder,
-    placeSellOrder,
-    placeBracketOrder,
-    getPositions,
-    cancelOrdersForTicker,
-    getAccessToken,
-    setAccountHash,
-    getAccountHash,
-    fetchAccountHash,
-    getAccountId,
-    // v1.2
-    isRegularHours,
-    getSessionType,
-    checkOrphanPositions,
-    closeOrphanPositions,
-    startOrphanCheck
+    getAuthUrl, exchangeCodeForTokens, refreshAccessToken,
+    startTokenRefresh, isAuthenticated, getTokenStatus,
+    placeBuyOrder, placeSellOrder, placeBracketOrder,
+    getPositions, cancelOrdersForTicker,
+    getAccessToken, setAccountHash, getAccountHash,
+    fetchAccountHash, getAccountId,
+    isRegularHours, getSessionType,
+    checkOrphanPositions, closeOrphanPositions, startOrphanCheck
 };
 
 module.exports = { schwabService };

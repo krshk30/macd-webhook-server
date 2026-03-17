@@ -1,20 +1,17 @@
 /**
- * Position Tracking Service
+ * Position Tracking Service v1.2.1
  * In-memory position state — no database latency
- * Tracks entries, scaled exits, milestones, and daily P&L
+ * Tracks entries, scaled exits, milestones, daily P&L, and orphan detection
  */
 
 const { log } = require('./logger');
 
-// Position state per ticker
 const positions = new Map();
 
-// Daily P&L tracking
 let dailyPnL = 0;
 let dailyTradeCount = 0;
 let lastResetDate = new Date().toDateString();
 
-// Duplicate alert filter (5-second window)
 const recentAlerts = new Map();
 const DEDUP_WINDOW_MS = 5000;
 
@@ -39,12 +36,9 @@ function isDuplicate(ticker, action) {
     }
 
     recentAlerts.set(key, now);
-
-    // Clean old entries
     for (const [k, t] of recentAlerts) {
         if (now - t > DEDUP_WINDOW_MS * 2) recentAlerts.delete(k);
     }
-
     return false;
 }
 
@@ -55,7 +49,7 @@ function isWithinTradingHours() {
     const hour = eastern.getHours();
     const minute = eastern.getMinutes();
     const startHour = parseInt(process.env.TRADING_START_HOUR || '7');
-    const endHour = parseInt(process.env.TRADING_END_HOUR || '16');
+    const endHour = parseInt(process.env.TRADING_END_HOUR || '18');
 
     log('DEBUG', `Trading hours check: ${hour}:${minute.toString().padStart(2,'0')} ET (window: ${startHour}:00-${endHour}:00)`);
     return hour >= startHour && hour < endHour;
@@ -134,6 +128,8 @@ function getOrphans(timeoutMins) {
     return result;
 }
 
+// ─── Scale / Close ─────────────────────────────────────────────
+
 function scalePosition(ticker, sellPct, reason, currentPrice) {
     const pos = positions.get(ticker);
     if (!pos) return null;
@@ -156,7 +152,6 @@ function scalePosition(ticker, sellPct, reason, currentPrice) {
     dailyPnL += scalePnL;
 
     log('POSITION', `Scaled ${ticker}: sold ${actualSell} shares (${reason}) | P&L: $${scalePnL.toFixed(2)}`);
-
     return { sharesToSell: actualSell, pnl: scalePnL };
 }
 
@@ -181,9 +176,7 @@ function closePosition(ticker, exitPrice, reason) {
     };
 
     positions.delete(ticker);
-
     log('POSITION', `Closed ${ticker}: ${remaining} remaining @ $${exitPrice.toFixed(2)} | P&L: $${pnl.toFixed(2)} | ${reason}`);
-
     return summary;
 }
 
@@ -192,15 +185,9 @@ function markMilestone(ticker, milestone) {
     if (!pos) return;
 
     switch (milestone) {
-        case 'PCT2':
-            pos.hit2pct = true;
-            break;
-        case 'FAST4':
-            pos.hitFast4pct = true;
-            break;
-        case 'PCT4_AFTER2':
-            pos.hit4after2 = true;
-            break;
+        case 'PCT2':      pos.hit2pct = true; break;
+        case 'FAST4':     pos.hitFast4pct = true; break;
+        case 'PCT4_AFTER2': pos.hit4after2 = true; break;
     }
 }
 
@@ -213,7 +200,8 @@ function getStatus() {
             entryPrice: p.entryPrice,
             remaining: p.remainingQuantity,
             soldPct: p.soldPct,
-            enteredAt: p.enteredAt
+            enteredAt: p.enteredAt,
+            isOrphan: p.isOrphan
         })),
         positionCount: positions.size,
         dailyPnL: dailyPnL.toFixed(2),

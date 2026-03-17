@@ -1,7 +1,6 @@
 /**
- * Debug Route — Schwab API Diagnostic (v1.1)
+ * Debug Route — Schwab API Diagnostic
  * Tests all Schwab endpoints and reports what's working
- * Visit /debug/schwab to run diagnostics
  */
 
 const express = require('express');
@@ -30,59 +29,38 @@ router.get('/schwab', async (req, res) => {
 
     const results = {};
 
-    // Test 1: User Preferences (basic token check)
     log('INFO', 'Debug: Testing userPreference...');
     try {
         const r = await axios.get('https://api.schwabapi.com/trader/v1/userPreference', { headers, timeout: 10000 });
         results.userPreference = { status: r.status, ok: true };
     } catch (err) {
-        results.userPreference = {
-            status: err.response?.status || 'ERROR',
-            ok: false,
-            error: err.response?.data || err.message
-        };
+        results.userPreference = { status: err.response?.status || 'ERROR', ok: false, error: err.response?.data || err.message };
     }
 
-    // Test 2: Account Numbers (the failing endpoint)
     log('INFO', 'Debug: Testing accounts/accountNumbers...');
     try {
         const r = await axios.get('https://api.schwabapi.com/trader/v1/accounts/accountNumbers', { headers, timeout: 10000 });
         results.accountNumbers = { status: r.status, ok: true, data: r.data };
     } catch (err) {
-        results.accountNumbers = {
-            status: err.response?.status || 'ERROR',
-            ok: false,
-            error: err.response?.data || err.message
-        };
+        results.accountNumbers = { status: err.response?.status || 'ERROR', ok: false, error: err.response?.data || err.message };
     }
 
-    // Test 3: Accounts list
     log('INFO', 'Debug: Testing accounts...');
     try {
         const r = await axios.get('https://api.schwabapi.com/trader/v1/accounts', { headers, timeout: 10000 });
         results.accounts = { status: r.status, ok: true };
     } catch (err) {
-        results.accounts = {
-            status: err.response?.status || 'ERROR',
-            ok: false,
-            error: err.response?.data || err.message
-        };
+        results.accounts = { status: err.response?.status || 'ERROR', ok: false, error: err.response?.data || err.message };
     }
 
-    // Test 4: Market data (non-account endpoint)
     log('INFO', 'Debug: Testing market data...');
     try {
         const r = await axios.get('https://api.schwabapi.com/marketdata/v1/quotes?symbols=AAPL&fields=quote', { headers, timeout: 10000 });
         results.marketData = { status: r.status, ok: true };
     } catch (err) {
-        results.marketData = {
-            status: err.response?.status || 'ERROR',
-            ok: false,
-            error: err.response?.data || err.message
-        };
+        results.marketData = { status: err.response?.status || 'ERROR', ok: false, error: err.response?.data || err.message };
     }
 
-    // Diagnosis
     let diagnosis = '';
     let fix = '';
 
@@ -99,26 +77,26 @@ router.get('/schwab', async (req, res) => {
         }
     } else if (results.accountNumbers.status === 500 && results.marketData.ok) {
         diagnosis = '🔴 Market data works but accounts do NOT';
-        fix = 'Your token lacks account permissions. Visit /auth/start to re-authenticate. During Schwab login, make sure you CHECK the brokerage account box when prompted.';
+        fix = 'Visit /auth/start to re-authenticate. CHECK the brokerage account box during login.';
     } else if (results.userPreference.status === 401) {
         diagnosis = '🔴 Token is invalid or expired';
         fix = 'Visit /auth/start to get a fresh token.';
     } else if (results.accountNumbers.status === 403) {
         diagnosis = '🔴 App lacks Accounts & Trading permission';
-        fix = 'On developer.schwab.com, edit your app and enable "Accounts and Trading Production".';
+        fix = 'On developer.schwab.com, edit app and enable "Accounts and Trading Production".';
     } else {
         diagnosis = `⚠️ Unexpected — accountNumbers returned ${results.accountNumbers.status}`;
-        fix = 'Email traderapi@schwab.com with the full output from this page.';
+        fix = 'Email traderapi@schwab.com with this output.';
     }
 
     log('INFO', `Debug result: ${diagnosis}`);
 
     res.json({
         timestamp: new Date().toISOString(),
-        diagnosis,
-        fix,
+        diagnosis, fix,
         accountHash: schwabService.getAccountHash() ? schwabService.getAccountHash().substring(0, 10) + '...' : null,
         tokenStatus: schwabService.getTokenStatus(),
+        session: schwabService.getSessionType(),
         results
     });
 });

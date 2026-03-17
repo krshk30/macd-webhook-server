@@ -1,9 +1,6 @@
 /**
- * MACD Momentum Webhook Server v1.1
- * Receives TradingView alerts → places orders via Schwab Trader API
- * Optimized for <500ms end-to-end latency
- * 
- * v1.1: Added /debug/schwab endpoint, account hash auto-fetch
+ * MACD Momentum Webhook Server v1.2.1
+ * TradingView alerts → Schwab Trader API → TOS execution
  */
 
 require('dotenv').config();
@@ -18,10 +15,7 @@ const { log } = require('./services/logger');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// JSON parsing — keep payload limit small for speed
 app.use(express.json({ limit: '10kb' }));
-
-// Trust Railway proxy for accurate IP logging
 app.set('trust proxy', 1);
 
 // Routes
@@ -32,11 +26,10 @@ app.use('/', webhookRouter);
 
 // Start server
 app.listen(PORT, () => {
-    log('INFO', `Server started on port ${PORT}`);
+    log('INFO', `Server v1.2.1 started on port ${PORT}`);
     log('INFO', `Environment: ${process.env.NODE_ENV || 'development'}`);
     log('INFO', `Schwab client configured: ${process.env.SCHWAB_CLIENT_ID ? 'YES' : 'NO'}`);
 
-    // Start token refresh timer if we have tokens
     schwabService.startTokenRefresh();
 
     // Start orphan position checker (catches repainting signals)
