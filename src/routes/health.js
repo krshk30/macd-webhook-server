@@ -17,7 +17,8 @@ router.get('/health', (req, res) => {
         schwab: {
             authenticated: schwabService.isAuthenticated(),
             tokenStatus: schwabService.getTokenStatus(),
-            accountId: process.env.SCHWAB_ACCOUNT_ID ? 'configured' : 'missing'
+            accountId: process.env.SCHWAB_ACCOUNT_ID ? 'configured' : 'missing',
+            accountHash: schwabService.getStoredAccountHash() ? 'auto-detected' : 'pending (will fetch on /auth/start)'
         },
         trading: positions.getStatus(),
         config: {
@@ -39,17 +40,28 @@ router.get('/positions', (req, res) => {
 
 // Get Schwab encrypted account hashes
 router.get('/accounts', async (req, res) => {
-    const result = await schwabService.getAccountHash();
-    if (result) {
+    const stored = schwabService.getStoredAccountHash();
+    if (stored) {
+        return res.json({
+            message: 'Account hash auto-detected and stored.',
+            storedHash: stored.substring(0, 8) + '...',
+            status: 'ready'
+        });
+    }
+
+    // Try fetching
+    const hash = await schwabService.fetchAndStoreAccountHash();
+    if (hash) {
         res.json({
-            message: 'Find your account hashValue below. Set it as SCHWAB_ACCOUNT_ID in Railway.',
-            source: result.source,
-            data: result.data
+            message: 'Account hash fetched and stored successfully.',
+            storedHash: hash.substring(0, 8) + '...',
+            status: 'ready'
         });
     } else {
-        res.status(500).json({ 
-            error: 'Failed to fetch accounts. Check Railway deploy logs for details.',
-            hint: 'Make sure you visited /auth/start first and token is valid.'
+        res.status(500).json({
+            error: 'Failed to fetch accounts. Schwab API may be experiencing issues.',
+            hint: 'Try again in a few minutes. Schwab returns 500 intermittently.',
+            workaround: 'The server will retry automatically when the first trade signal arrives.'
         });
     }
 });

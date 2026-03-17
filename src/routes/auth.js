@@ -30,11 +30,17 @@ router.get('/callback', async (req, res) => {
     const success = await schwabService.exchangeCodeForTokens(code);
 
     if (success) {
+        // Auto-fetch account hash after successful auth
+        log('AUTH', 'Fetching account hash...');
+        const hashResult = await schwabService.fetchAndStoreAccountHash();
+
         res.send(`
             <h2>Authentication Successful</h2>
             <p>Schwab API tokens obtained. Server is now ready to trade.</p>
             <p>Token status: ${schwabService.getTokenStatus()}</p>
+            <p>Account hash: ${hashResult ? 'Found and stored automatically' : 'Failed to fetch (will retry on first trade)'}</p>
             <p><a href="/health">Check health status</a></p>
+            <p><a href="/accounts">View account details</a></p>
         `);
     } else {
         res.status(500).send(`

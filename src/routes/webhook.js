@@ -31,6 +31,12 @@ router.post('/webhook', async (req, res) => {
         return res.status(503).json({ error: 'not_authenticated' });
     }
 
+    // ─── Step 2.5: Ensure account hash is available ─────────────
+    if (!schwabService.getStoredAccountHash() && !DRY_RUN()) {
+        log('INFO', 'Account hash not yet fetched, fetching now...');
+        await schwabService.fetchAndStoreAccountHash();
+    }
+
     const { action, ticker, price } = body;
     if (!action || !ticker) {
         return res.status(400).json({ error: 'missing action or ticker' });

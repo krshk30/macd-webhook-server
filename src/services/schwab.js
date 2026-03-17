@@ -154,7 +154,60 @@ function getTokenStatus() {
 
 // ─── Order Placement ───────────────────────────────────────────
 
-const accountId = () => process.env.SCHWAB_ACCOUNT_ID;
+// Account hash storage — Schwab API requires encrypted hash, not plain account number
+let storedAccountHash = null;
+
+const accountId = () => storedAccountHash || process.env.SCHWAB_ACCOUNT_ID;
+
+/**
+ * Fetch account hash from Schwab and store it
+ * Schwab API uses encrypted hashes, not plain account numbers
+ * Retries up to 3 times with delay (Schwab 500 errors are intermittent)
+ */
+async function fetchAndStoreAccountHash() {
+    const targetAccount = process.env.SCHWAB_ACCOUNT_ID;
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            log('INFO', `Fetching account hash (attempt ${attempt}/3)...`);
+            const response = await api.get('/accounts/accountNumbers');
+            const accounts = response.data;
+
+            log('INFO', `Found ${accounts.length} account(s): ${JSON.stringify(accounts)}`);
+
+            if (accounts && accounts.length > 0) {
+                // Try to match by account number
+                const match = accounts.find(a =>
+                    a.accountNumber === targetAccount ||
+                    a.accountNumber.endsWith(targetAccount) ||
+                    targetAccount.endsWith(a.accountNumber)
+                );
+
+                if (match) {
+                    storedAccountHash = match.hashValue;
+                    log('INFO', `Account hash found for ...${targetAccount.slice(-4)}: ${storedAccountHash.substring(0, 8)}...`);
+                } else {
+                    // Just use the first account
+                    storedAccountHash = accounts[0].hashValue;
+                    log('INFO', `Using first account hash: ${storedAccountHash.substring(0, 8)}... (account: ${accounts[0].accountNumber})`);
+                }
+                return storedAccountHash;
+            }
+        } catch (err) {
+            log('WARN', `Account hash fetch attempt ${attempt} failed: ${err.response?.status} ${err.response?.data ? JSON.stringify(err.response.data) : err.message}`);
+            if (attempt < 3) {
+                await new Promise(r => setTimeout(r, 2000 * attempt));  // Wait 2s, 4s between retries
+            }
+        }
+    }
+
+    log('ERROR', 'Could not fetch account hash after 3 attempts. Will use SCHWAB_ACCOUNT_ID as-is.');
+    return null;
+}
+
+function getStoredAccountHash() {
+    return storedAccountHash;
+}
 
 /**
  * Place a market buy order with optional bracket (TP/SL)
@@ -381,6 +434,8 @@ const schwabService = {
     placeBuyWithStopLoss,
     getPositions,
     getAccountHash,
+    fetchAndStoreAccountHash,
+    getStoredAccountHash,
     cancelOrdersForTicker
 };
 
