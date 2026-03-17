@@ -96,7 +96,9 @@ function openPosition(ticker, entryPrice, quantity) {
         hitFast4pct: false,
         hit4after2: false,
         soldPct: 0,
-        scaledExits: []
+        scaledExits: [],
+        isOrphan: false,
+        orphanDetectedAt: null
     });
 
     dailyTradeCount++;
@@ -105,6 +107,31 @@ function openPosition(ticker, entryPrice, quantity) {
 
 function getPosition(ticker) {
     return positions.get(ticker) || null;
+}
+
+// ─── Orphan Position Tracking ──────────────────────────────────
+
+function markOrphan(ticker) {
+    const pos = positions.get(ticker);
+    if (pos) {
+        pos.isOrphan = true;
+        pos.orphanDetectedAt = new Date();
+        log('WARN', `Marked ${ticker} as orphan`);
+    }
+}
+
+function getOrphans(timeoutMins) {
+    const result = [];
+    const now = Date.now();
+    for (const pos of positions.values()) {
+        if (pos.isOrphan && pos.orphanDetectedAt) {
+            const elapsed = (now - new Date(pos.orphanDetectedAt).getTime()) / 60000;
+            if (elapsed >= timeoutMins) {
+                result.push(pos);
+            }
+        }
+    }
+    return result;
 }
 
 function scalePosition(ticker, sellPct, reason, currentPrice) {
@@ -205,6 +232,8 @@ module.exports = {
         scalePosition,
         closePosition,
         markMilestone,
-        getStatus
+        getStatus,
+        markOrphan,
+        getOrphans
     }
 };

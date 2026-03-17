@@ -38,4 +38,8 @@ app.listen(PORT, () => {
 
     // Start token refresh timer if we have tokens
     schwabService.startTokenRefresh();
+
+    // Start orphan position checker (catches repainting signals)
+    const { positions } = require('./services/positions');
+    schwabService.startOrphanCheck(positions);
 });

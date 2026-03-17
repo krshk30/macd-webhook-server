@@ -88,7 +88,7 @@ async function handleBuy(ticker, price, body) {
     if (entryPrice > 0) {
         result = await schwabService.placeBracketOrder(ticker, qty, tpPrice, slPrice);
     } else {
-        result = await schwabService.placeBuyOrder(ticker, qty);
+        result = await schwabService.placeBuyOrder(ticker, qty, entryPrice);
     }
 
     if (result.success) {
@@ -131,7 +131,8 @@ async function handleScale(ticker, price, body) {
     const result = await schwabService.placeSellOrder(
         ticker,
         scaleResult.sharesToSell,
-        `Scale ${level} (${sellPct}%)`
+        `Scale ${level} (${sellPct}%)`,
+        currentPrice
     );
 
     return {
@@ -162,7 +163,8 @@ async function handleClose(ticker, price, body) {
     const result = await schwabService.placeSellOrder(
         ticker,
         pos.remainingQuantity,
-        `Close: ${reason}`
+        `Close: ${reason}`,
+        exitPrice
     );
 
     const summary = positions.closePosition(ticker, exitPrice, reason);
