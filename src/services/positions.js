@@ -49,10 +49,15 @@ function isDuplicate(ticker, action) {
 }
 
 function isWithinTradingHours() {
+    // Railway runs in UTC — convert to Eastern for US market hours
     const now = new Date();
-    const hour = now.getHours();
+    const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const hour = eastern.getHours();
+    const minute = eastern.getMinutes();
     const startHour = parseInt(process.env.TRADING_START_HOUR || '7');
     const endHour = parseInt(process.env.TRADING_END_HOUR || '16');
+
+    log('DEBUG', `Trading hours check: ${hour}:${minute.toString().padStart(2,'0')} ET (window: ${startHour}:00-${endHour}:00)`);
     return hour >= startHour && hour < endHour;
 }
 
