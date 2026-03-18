@@ -1,7 +1,3 @@
-/**
- * Notification Service — Discord webhook
- * Always async, never blocks order execution
- */
 const axios = require('axios');
 const { log } = require('./logger');
 
@@ -13,7 +9,6 @@ const COLORS = {
 async function notify(message, type = 'info') {
     const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
     if (!webhookUrl) return;
-
     setImmediate(async () => {
         try {
             await axios.post(webhookUrl, {
@@ -22,7 +17,7 @@ async function notify(message, type = 'info') {
                     description: message,
                     color: COLORS[type] || COLORS.info,
                     timestamp: new Date().toISOString(),
-                    footer: { text: 'Webhook Server v1.2.1' }
+                    footer: { text: 'Webhook Server v1.2.2' }
                 }]
             }, { timeout: 3000 });
         } catch (err) {
@@ -30,5 +25,4 @@ async function notify(message, type = 'info') {
         }
     });
 }
-
 module.exports = { notify };
