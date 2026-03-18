@@ -45,9 +45,7 @@ async function handleBuy(ticker, price, body) {
     const entryPrice = parseFloat(price) || 0;
     const tpPrice = entryPrice + TP_CENTS();
     const slPrice = entryPrice - SL_CENTS();
-    const result = entryPrice > 0
-        ? await schwabService.placeBracketOrder(ticker, qty, tpPrice, slPrice)
-        : await schwabService.placeBuyOrder(ticker, qty, entryPrice);
+    const result = await schwabService.placeBuyOrder(ticker, qty, entryPrice);
     if (result.success) positions.openPosition(ticker, entryPrice, qty);
     return { success: result.success, action: 'BUY', ticker, quantity: qty, entryPrice,
         tp: tpPrice.toFixed(2), sl: slPrice.toFixed(2), orderId: result.orderId,
