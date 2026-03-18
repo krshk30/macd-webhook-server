@@ -164,26 +164,17 @@ function getAccountId() {
 
 async function getPositionsFromSchwab() {
     try {
-        // Step 1: Get positions via /accounts (no fields param)
-        const response = await api.get('/accounts');
+        const response = await axios.get(`${SCHWAB_API_BASE}/accounts`, {
+            headers: {
+                'Authorization': `Bearer ${tokens.access_token}`,
+                'Accept': 'application/json'
+            },
+            httpsAgent: keepAliveAgent,
+            timeout: 10000
+        });
         const allAccounts = response.data || [];
         const account = allAccounts.find(a => a.securitiesAccount) || allAccounts[0] || {};
-        const positions = account?.securitiesAccount?.positions || [];
-        
-        // If positions found, return them
-        if (positions.length > 0) return positions;
-        
-        // Step 2: If empty, try single account with hash
-        if (accountHash) {
-            try {
-                const r2 = await api.get(`/accounts/${accountHash}`);
-                return r2.data?.securitiesAccount?.positions || [];
-            } catch (e) {
-                // Silent fail — just means no positions
-            }
-        }
-        
-        return [];
+        return account?.securitiesAccount?.positions || [];
     } catch (err) {
         log('DEBUG', `Positions check: ${err.response?.status || err.message}`);
         return [];
