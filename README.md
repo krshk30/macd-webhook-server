@@ -1,21 +1,14 @@
-# MACD Momentum Webhook Server v1.2.2
+# MACD Momentum Webhook Server v1.2.4
 
-TradingView alerts → Schwab Trader API → TOS execution.
-
-## v1.2.2 Fix
-- **Orphan checker 400 error resolved**: Now uses `/accounts` endpoint instead of `/accounts/{hash}?fields=positions`
-- The single-account endpoint was returning 400 for Individual API apps
-- `/accounts` returns all accounts with positions by default and works reliably
-
-## Deploy
-1. Push to GitHub → Railway auto-deploys
-2. `/auth/start` to authenticate
-3. `/debug/schwab` to verify
-4. Logs should show clean orphan checks (no more 400 spam)
+## v1.2.4: handleClose zero-quantity guard
+- If all shares already sold via scale exits, CLOSE just cleans up the tracker
+- No more "OrderLeg Quantity should not be zero" errors from Schwab
 
 ## Full Changelog
-- **v1.2.2**: Fixed orphan/positions 400 — uses /accounts list endpoint
-- **v1.2.1**: Auth hash retry with 3s delay, better error logging
-- **v1.2**: Extended hours auto LIMIT, orphan safety net, session detection
-- **v1.1**: Account hash auto-fetch, /debug/schwab diagnostic
-- **v1.0**: Core server, OAuth2, bracket orders, position tracking
+- v1.2.4: handleClose zero-quantity fix
+- v1.2.3: 1-min orphan check, raw axios positions, bracket skip ext hours
+- v1.2.2: /accounts endpoint for positions
+- v1.2.1: Auth hash retry 3s delay
+- v1.2: Extended hours LIMIT, orphan safety
+- v1.1: Account hash, /debug/schwab
+- v1.0: Core server, OAuth2, bracket orders
