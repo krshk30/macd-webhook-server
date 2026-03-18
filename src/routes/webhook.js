@@ -1,6 +1,8 @@
 /**
- * Webhook Route v1.2.4
- * v1.2.4: handleClose skips sell if remainingQuantity <= 0 (all scaled out)
+ * Webhook Route v1.2.5
+ * - No bracket orders (simple BUY only)
+ * - CANCEL_BUY handler for repaint detection
+ * - handleClose zero-quantity guard
  */
 const express = require('express');
 const { schwabService } = require('../services/schwab');
@@ -10,8 +12,6 @@ const { log } = require('../services/logger');
 const router = express.Router();
 
 const DEFAULT_QTY = () => parseInt(process.env.DEFAULT_QUANTITY || '10');
-const TP_CENTS = () => parseFloat(process.env.TP_CENTS || '0.08');
-const SL_CENTS = () => parseFloat(process.env.SL_CENTS || '0.05');
 
 router.post('/webhook', async (req, res) => {
     const receiveTime = Date.now();
@@ -26,9 +26,10 @@ router.post('/webhook', async (req, res) => {
     let result;
     try {
         switch (action) {
-            case 'BUY':   result = await handleBuy(ticker, price, body); break;
-            case 'SCALE': result = await handleScale(ticker, price, body); break;
-            case 'CLOSE': result = await handleClose(ticker, price, body); break;
+            case 'BUY':        result = await handleBuy(ticker, price, body); break;
+            case 'SCALE':      result = await handleScale(ticker, price, body); break;
+            case 'CLOSE':      result = await handleClose(ticker, price, body); break;
+            case 'CANCEL_BUY': result = await handleCancelBuy(ticker, price, body); break;
             default: return res.status(400).json({ error: `unknown action: ${action}` });
         }
     } catch (err) { log('ERROR', `Webhook error: ${err.message}`); result = { success: false, error: err.message }; }
@@ -38,64 +39,83 @@ router.post('/webhook', async (req, res) => {
     res.json({ ...result, serverLatency: totalLatency });
 });
 
+// ─── BUY (simple order, no bracket) ────────────────────────────
 async function handleBuy(ticker, price, body) {
     const check = positions.canOpenPosition(ticker);
     if (!check.allowed) { log('REJECT', `BUY ${ticker}: ${check.reason}`); return { success: false, rejected: check.reason }; }
     const qty = DEFAULT_QTY();
     const entryPrice = parseFloat(price) || 0;
-    const tpPrice = entryPrice + TP_CENTS();
-    const slPrice = entryPrice - SL_CENTS();
     const result = await schwabService.placeBuyOrder(ticker, qty, entryPrice);
     if (result.success) positions.openPosition(ticker, entryPrice, qty);
     return { success: result.success, action: 'BUY', ticker, quantity: qty, entryPrice,
-        tp: tpPrice.toFixed(2), sl: slPrice.toFixed(2), orderId: result.orderId,
-        schwabLatency: result.latency, session: schwabService.getSessionType(), path: body.path || 'unknown' };
+        orderId: result.orderId, schwabLatency: result.latency,
+        session: schwabService.getSessionType(), path: body.path || 'unknown' };
 }
 
+// ─── CANCEL_BUY (repaint detected — close immediately) ────────
+async function handleCancelBuy(ticker, price, body) {
+    const pos = positions.getPosition(ticker);
+    if (!pos) {
+        log('INFO', `CANCEL_BUY ${ticker}: no position (order may not have filled)`);
+        return { success: true, action: 'CANCEL_BUY', ticker, reason: 'no_position' };
+    }
+
+    const exitPrice = parseFloat(price) || pos.entryPrice;
+    log('WARN', `⚠️ REPAINT DETECTED: ${ticker} — closing ${pos.remainingQuantity} shares`);
+
+    // Cancel any open orders for this ticker first
+    await schwabService.cancelOrdersForTicker(ticker);
+
+    // Sell all shares immediately
+    const result = await schwabService.placeSellOrder(
+        ticker, pos.remainingQuantity, 'REPAINT_CANCEL', exitPrice
+    );
+
+    const summary = positions.closePosition(ticker, exitPrice, 'REPAINT_CANCEL');
+
+    await notify(
+        `⚠️ REPAINT CANCEL: ${ticker} x${summary.remainingClosed}\n` +
+        `Entry: $${summary.entryPrice.toFixed(2)} → Exit: $${exitPrice.toFixed(2)}\n` +
+        `P&L: $${summary.pnl.toFixed(2)} | BUY signal disappeared`,
+        'error'
+    );
+
+    return { success: result.success, action: 'CANCEL_BUY', ticker,
+        sharesClosed: summary.remainingClosed, pnl: summary.pnl.toFixed(2),
+        reason: 'REPAINT', schwabLatency: result.latency };
+}
+
+// ─── SCALE ─────────────────────────────────────────────────────
 async function handleScale(ticker, price, body) {
     const pos = positions.getPosition(ticker);
     if (!pos) { log('REJECT', `SCALE ${ticker}: no position`); return { success: false, rejected: 'no position' }; }
-    const level = body.level;
-    const sellPct = parseInt(body.sell_pct) || 50;
-    const currentPrice = parseFloat(price) || 0;
+    const level = body.level, sellPct = parseInt(body.sell_pct) || 50, currentPrice = parseFloat(price) || 0;
     positions.markMilestone(ticker, level);
     const scaleResult = positions.scalePosition(ticker, sellPct, level, currentPrice);
-    if (!scaleResult || scaleResult.sharesToSell <= 0) {
-        log('WARN', `SCALE ${ticker}: nothing to sell (${sellPct}% of ${pos.initialQuantity})`);
-        return { success: false, rejected: 'nothing to sell' };
-    }
+    if (!scaleResult || scaleResult.sharesToSell <= 0) { log('WARN', `SCALE ${ticker}: nothing to sell`); return { success: false, rejected: 'nothing to sell' }; }
     const result = await schwabService.placeSellOrder(ticker, scaleResult.sharesToSell, `Scale ${level} (${sellPct}%)`, currentPrice);
-    return { success: result.success, action: 'SCALE', ticker, level,
-        sharesSold: scaleResult.sharesToSell, remaining: pos.remainingQuantity,
-        scalePnL: scaleResult.pnl.toFixed(2), schwabLatency: result.latency };
+    return { success: result.success, action: 'SCALE', ticker, level, sharesSold: scaleResult.sharesToSell,
+        remaining: pos.remainingQuantity, scalePnL: scaleResult.pnl.toFixed(2), schwabLatency: result.latency };
 }
 
+// ─── CLOSE ─────────────────────────────────────────────────────
 async function handleClose(ticker, price, body) {
     const pos = positions.getPosition(ticker);
     if (!pos) { log('REJECT', `CLOSE ${ticker}: no position`); return { success: false, rejected: 'no position' }; }
+    const exitPrice = parseFloat(price) || 0, reason = body.reason || 'unknown';
 
-    const exitPrice = parseFloat(price) || 0;
-    const reason = body.reason || 'unknown';
-
-    // v1.2.4: If all shares already scaled out, just clean up tracker — don't send empty sell
+    // If fully scaled out, just clean up tracker
     if (pos.remainingQuantity <= 0) {
-        log('INFO', `CLOSE ${ticker}: already fully scaled out (0 remaining) — cleaning up tracker`);
+        log('INFO', `CLOSE ${ticker}: fully scaled out — cleaning tracker`);
         const summary = positions.closePosition(ticker, exitPrice, 'all_scaled_out');
-        return { success: true, action: 'CLOSE', ticker, reason: 'all_scaled_out',
-            sharesClosed: 0, pnl: summary ? summary.pnl.toFixed(2) : '0.00' };
+        return { success: true, action: 'CLOSE', ticker, reason: 'all_scaled_out', sharesClosed: 0, pnl: summary ? summary.pnl.toFixed(2) : '0.00' };
     }
 
     await schwabService.cancelOrdersForTicker(ticker);
     const result = await schwabService.placeSellOrder(ticker, pos.remainingQuantity, `Close: ${reason}`, exitPrice);
     const summary = positions.closePosition(ticker, exitPrice, reason);
-
-    await notify(
-        `CLOSED ${ticker}\nEntry: $${summary.entryPrice.toFixed(2)} → Exit: $${exitPrice.toFixed(2)}\nP&L: $${summary.pnl.toFixed(2)} | ${reason}`,
-        summary.pnl >= 0 ? 'profit' : 'loss'
-    );
-
-    return { success: result.success, action: 'CLOSE', ticker, reason,
-        sharesClosed: summary.remainingClosed, pnl: summary.pnl.toFixed(2), schwabLatency: result.latency };
+    await notify(`CLOSED ${ticker}\nEntry: $${summary.entryPrice.toFixed(2)} → Exit: $${exitPrice.toFixed(2)}\nP&L: $${summary.pnl.toFixed(2)} | ${reason}`, summary.pnl >= 0 ? 'profit' : 'loss');
+    return { success: result.success, action: 'CLOSE', ticker, reason, sharesClosed: summary.remainingClosed, pnl: summary.pnl.toFixed(2), schwabLatency: result.latency };
 }
 
 module.exports = { webhookRouter: router };

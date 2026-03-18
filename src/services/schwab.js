@@ -1,24 +1,28 @@
 /**
- * Schwab Trader API Service v1.2.4
+ * Schwab Trader API Service v1.2.5
  *
  * SCHWAB API QUIRKS (DO NOT CHANGE):
- * 1. /accounts/{hash}?fields=positions → 400
- * 2. /accounts?fields=positions → 400
- * 3. /accounts (no params, raw axios) → 200
- * 4. getPositionsFromSchwab MUST use raw axios with Accept header
- * 5. Bracket (TRIGGER) orders fail with SEAMLESS → skip in ext hours
- * 6. Fresh tokens need 3s before account endpoints work
- * 7. All time checks use Eastern, not UTC
- * 8. Position failures log at DEBUG level
+ * 1.  /accounts/{hash}?fields=positions → 400
+ * 2.  /accounts?fields=positions → 400
+ * 3.  /accounts (no params, raw axios) → 200
+ * 4.  getPositionsFromSchwab MUST use raw axios with Accept header
+ * 5.  Bracket (TRIGGER) fails with SEAMLESS → skip in ext hours
+ * 6.  Fresh tokens need 3s before account endpoints work
+ * 7.  All time checks use Eastern, not UTC
+ * 8.  Position failures log at DEBUG level
+ * 9.  api instance sends Content-Type on GETs → Schwab rejects
+ * 10. cancelOrdersForTicker MUST use raw axios + date range (not status filter)
+ * 11. Bracket child orders are WORKING/ACCEPTED, not QUEUED
+ * 12. No bracket orders — causes orphan TP/SL that interfere with SCALE exits
  *
- * CHANGELOG:
- * v1.2.4: handleClose zero-quantity guard (server-side)
- * v1.2.3: 1-min orphan check, raw axios for positions
- * v1.2.2: /accounts instead of /accounts/{hash}?fields
- * v1.2.1: fetchAccountHash retry 3s delay
+ * v1.2.5: No brackets, CANCEL_BUY handler, fixed cancelOrdersForTicker
+ * v1.2.4: handleClose zero-qty guard
+ * v1.2.3: 1-min orphan, raw axios positions
+ * v1.2.2: /accounts for positions
+ * v1.2.1: fetchAccountHash retry
  * v1.2: Extended hours LIMIT, orphan safety
- * v1.1: Account hash auto-fetch, /debug/schwab
- * v1.0: OAuth2, token refresh, bracket orders
+ * v1.1: Account hash, /debug/schwab
+ * v1.0: OAuth2, token refresh, orders
  */
 const axios = require('axios');
 const { log } = require('./logger');
@@ -34,17 +38,18 @@ let tokens = { access_token: null, refresh_token: null, expires_at: 0, token_typ
 let accountHash = null;
 let refreshTimer = null, orphanCheckTimer = null;
 
+// API instance for POST orders (Content-Type OK for POST)
 const api = axios.create({ baseURL: SCHWAB_API_BASE, httpsAgent: keepAliveAgent, timeout: 5000, headers: { 'Content-Type': 'application/json' } });
 api.interceptors.request.use(config => { if (tokens.access_token) config.headers.Authorization = `Bearer ${tokens.access_token}`; return config; });
 
 // ─── Market Hours ──────────────────────────────────────────────
 function getEasternTime() { return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })); }
-function isRegularHours() { const et = getEasternTime(); return (et.getHours() * 60 + et.getMinutes()) >= 570 && (et.getHours() * 60 + et.getMinutes()) < 960; }
+function isRegularHours() { const et = getEasternTime(); const m = et.getHours() * 60 + et.getMinutes(); return m >= 570 && m < 960; }
 function getSessionType() { return isRegularHours() ? 'NORMAL' : 'SEAMLESS'; }
-function getOrderType(requestedType, price) {
-    if (isRegularHours()) return requestedType;
-    if (requestedType === 'MARKET' && price && price > 0) { log('ORDER', `Extended hours — MARKET → LIMIT @ $${price.toFixed(2)}`); return 'LIMIT'; }
-    return requestedType;
+function getOrderType(requested, price) {
+    if (isRegularHours()) return requested;
+    if (requested === 'MARKET' && price && price > 0) { log('ORDER', `Extended hours — MARKET → LIMIT @ $${price.toFixed(2)}`); return 'LIMIT'; }
+    return requested;
 }
 
 // ─── OAuth2 ────────────────────────────────────────────────────
@@ -55,10 +60,9 @@ async function exchangeCodeForTokens(authCode) {
     try {
         const r = await axios.post(SCHWAB_TOKEN_URL, new URLSearchParams({ grant_type: 'authorization_code', code: authCode, redirect_uri: process.env.SCHWAB_CALLBACK_URL }).toString(),
             { headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' }, httpsAgent: keepAliveAgent });
-        tokens.access_token = r.data.access_token; tokens.refresh_token = r.data.refresh_token;
-        tokens.expires_at = Date.now() + (r.data.expires_in * 1000); tokens.token_type = r.data.token_type || 'Bearer';
+        tokens = { access_token: r.data.access_token, refresh_token: r.data.refresh_token, expires_at: Date.now() + (r.data.expires_in * 1000), token_type: r.data.token_type || 'Bearer' };
         log('INFO', 'OAuth tokens obtained'); startTokenRefresh(); return true;
-    } catch (err) { log('ERROR', `Token exchange failed: ${err.response?.data?.error || err.message}`); return false; }
+    } catch (err) { log('ERROR', `Token exchange: ${err.response?.data?.error || err.message}`); return false; }
 }
 
 async function refreshAccessToken() {
@@ -69,54 +73,42 @@ async function refreshAccessToken() {
             { headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' }, httpsAgent: keepAliveAgent });
         tokens.access_token = r.data.access_token; tokens.expires_at = Date.now() + (r.data.expires_in * 1000);
         if (r.data.refresh_token) tokens.refresh_token = r.data.refresh_token;
-        log('INFO', `Token refreshed. Expires in ${r.data.expires_in}s`); return true;
-    } catch (err) { log('ERROR', `Token refresh failed: ${err.response?.data?.error || err.message}`); await notify('TOKEN REFRESH FAILED', 'error'); return false; }
+        log('INFO', `Token refreshed ${r.data.expires_in}s`); return true;
+    } catch (err) { log('ERROR', `Token refresh: ${err.response?.data?.error || err.message}`); await notify('TOKEN REFRESH FAILED', 'error'); return false; }
 }
 
-function startTokenRefresh() {
-    if (refreshTimer) clearInterval(refreshTimer);
-    refreshTimer = setInterval(async () => { log('INFO', 'Token refresh...'); await refreshAccessToken(); }, 25 * 60 * 1000);
-    log('INFO', 'Token auto-refresh started (25 min)');
-}
+function startTokenRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(async () => { log('INFO', 'Token refresh...'); await refreshAccessToken(); }, 25 * 60 * 1000); log('INFO', 'Token refresh started (25 min)'); }
 function isAuthenticated() { return tokens.access_token && Date.now() < tokens.expires_at; }
-function getTokenStatus() {
-    if (!tokens.access_token) return 'no_token'; if (Date.now() >= tokens.expires_at) return 'expired';
-    return `valid (${Math.round((tokens.expires_at - Date.now()) / 60000)}m remaining)`;
-}
+function getTokenStatus() { if (!tokens.access_token) return 'no_token'; if (Date.now() >= tokens.expires_at) return 'expired'; return `valid (${Math.round((tokens.expires_at - Date.now()) / 60000)}m remaining)`; }
 
 // ─── Account Hash ──────────────────────────────────────────────
 function getAccessToken() { return tokens.access_token; }
-function setAccountHash(hash) { accountHash = hash; log('INFO', `Account hash stored: ${hash.substring(0, 10)}...`); }
+function setAccountHash(hash) { accountHash = hash; log('INFO', `Hash stored: ${hash.substring(0, 10)}...`); }
 function getAccountHash() { return accountHash; }
 async function fetchAccountHash() {
     if (!tokens.access_token) return null;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-            const r = await api.get('/accounts/accountNumbers');
-            if (r.data?.length > 0) { accountHash = r.data[0].hashValue; log('INFO', `Hash: ${r.data[0].accountNumber} → ${accountHash.substring(0, 10)}...`); return accountHash; }
-        } catch (err) { log('WARN', `Hash attempt ${attempt} failed (${err.response?.status})`); if (attempt < 2) { await new Promise(r => setTimeout(r, 3000)); } }
+    for (let i = 1; i <= 2; i++) {
+        try { const r = await api.get('/accounts/accountNumbers'); if (r.data?.length > 0) { accountHash = r.data[0].hashValue; log('INFO', `Hash: ${r.data[0].accountNumber} → ${accountHash.substring(0, 10)}...`); return accountHash; } }
+        catch (err) { log('WARN', `Hash attempt ${i}: ${err.response?.status}`); if (i < 2) await new Promise(r => setTimeout(r, 3000)); }
     }
-    log('ERROR', 'Hash failed — use /debug/schwab'); return null;
+    log('ERROR', 'Hash failed — /debug/schwab'); return null;
 }
 function getAccountId() { return accountHash || process.env.SCHWAB_ACCOUNT_HASH || process.env.SCHWAB_ACCOUNT_ID; }
 
-// ─── Fetch Positions (raw axios — NOT api instance) ────────────
+// ─── Positions (raw axios — NOT api instance) ──────────────────
 async function getPositionsFromSchwab() {
     try {
-        const r = await axios.get(`${SCHWAB_API_BASE}/accounts`, {
-            headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Accept': 'application/json' },
-            httpsAgent: keepAliveAgent, timeout: 10000
-        });
-        const account = (r.data || []).find(a => a.securitiesAccount) || r.data?.[0] || {};
-        return account?.securitiesAccount?.positions || [];
-    } catch (err) { log('DEBUG', `Positions check: ${err.response?.status || err.message}`); return []; }
+        const r = await axios.get(`${SCHWAB_API_BASE}/accounts`, { headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Accept': 'application/json' }, httpsAgent: keepAliveAgent, timeout: 10000 });
+        const acct = (r.data || []).find(a => a.securitiesAccount) || r.data?.[0] || {};
+        return acct?.securitiesAccount?.positions || [];
+    } catch (err) { log('DEBUG', `Positions: ${err.response?.status || err.message}`); return []; }
 }
 
-// ─── Order Placement ───────────────────────────────────────────
+// ─── Order Placement (v1.2.5: NO brackets — simple orders only) ─
+
 async function placeBuyOrder(ticker, quantity, price) {
     const startTime = Date.now(); const session = getSessionType(); const orderType = getOrderType('MARKET', price);
-    const order = { orderType, session, duration: 'DAY', orderStrategyType: 'SINGLE',
-        orderLegCollection: [{ instruction: 'BUY', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }] };
+    const order = { orderType, session, duration: 'DAY', orderStrategyType: 'SINGLE', orderLegCollection: [{ instruction: 'BUY', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }] };
     if (orderType === 'LIMIT' && price > 0) order.price = price.toFixed(2);
     try {
         const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
@@ -129,8 +121,7 @@ async function placeBuyOrder(ticker, quantity, price) {
 
 async function placeSellOrder(ticker, quantity, reason, price) {
     const startTime = Date.now(); const session = getSessionType(); const orderType = getOrderType('MARKET', price);
-    const order = { orderType, session, duration: 'DAY', orderStrategyType: 'SINGLE',
-        orderLegCollection: [{ instruction: 'SELL', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }] };
+    const order = { orderType, session, duration: 'DAY', orderStrategyType: 'SINGLE', orderLegCollection: [{ instruction: 'SELL', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }] };
     if (orderType === 'LIMIT' && price > 0) order.price = price.toFixed(2);
     try {
         const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
@@ -141,108 +132,71 @@ async function placeSellOrder(ticker, quantity, reason, price) {
     } catch (err) { log('ERROR', `SELL failed: ${err.response?.data?.message || err.message}`); return { success: false, error: err.response?.data?.message || err.message, latency: Date.now() - startTime }; }
 }
 
-async function placeBracketOrder(ticker, quantity, tpPrice, slPrice) {
-    const startTime = Date.now(); const session = getSessionType();
-    if (!isRegularHours()) { log('ORDER', 'Extended hours — bracket not supported, simple LIMIT'); return await placeBuyOrder(ticker, quantity, (tpPrice + slPrice) / 2); }
-    const order = { orderType: 'MARKET', session, duration: 'DAY', orderStrategyType: 'TRIGGER',
-        orderLegCollection: [{ instruction: 'BUY', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }],
-        childOrderStrategies: [
-            { orderType: 'LIMIT', session, duration: 'DAY', price: tpPrice.toFixed(2), orderStrategyType: 'SINGLE', orderLegCollection: [{ instruction: 'SELL', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }] },
-            { orderType: 'STOP', session, duration: 'DAY', stopPrice: slPrice.toFixed(2), orderStrategyType: 'SINGLE', orderLegCollection: [{ instruction: 'SELL', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }] }
-        ] };
-    try {
-        const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
-        const latency = Date.now() - startTime; const orderId = r.headers.location?.split('/').pop();
-        log('ORDER', `BRACKET BUY ${quantity} ${ticker} TP:$${tpPrice.toFixed(2)} SL:$${slPrice.toFixed(2)} | ${latency}ms`);
-        await notify(`BRACKET BUY ${quantity} ${ticker}\nTP:$${tpPrice.toFixed(2)} SL:$${slPrice.toFixed(2)} | ${latency}ms`, 'buy');
-        return { success: true, orderId, latency };
-    } catch (err) { log('ERROR', `BRACKET failed: ${err.response?.data?.message || err.message}`); log('WARN', 'Falling back to simple buy...'); return await placeBuyOrder(ticker, quantity, (tpPrice + slPrice) / 2); }
-}
-
-// ─── Orphan Safety ─────────────────────────────────────────────
-async function checkOrphanPositions(positionsTracker) {
-    if (!isAuthenticated() || !accountHash) return;
-    try {
-        const schwabPositions = await getPositionsFromSchwab();
-        for (const pos of schwabPositions) {
-            const symbol = pos.instrument?.symbol; const qty = pos.longQuantity || 0;
-            if (!symbol || qty <= 0) continue;
-            if (!positionsTracker.getPosition(symbol)) {
-                const avgPrice = pos.averagePrice || 0;
-                log('WARN', `ORPHAN: ${symbol} x${qty} @ $${avgPrice.toFixed(2)}`);
-                await notify(`⚠️ ORPHAN: ${symbol} x${qty} @ $${avgPrice.toFixed(2)}\nAuto-close in ${process.env.ORPHAN_TIMEOUT_MINS || 5} mins.`, 'error');
-                positionsTracker.openPosition(symbol, avgPrice, qty); positionsTracker.markOrphan(symbol);
-            }
-        }
-    } catch (err) { log('DEBUG', `Orphan error: ${err.message}`); }
-}
-
-async function closeOrphanPositions(positionsTracker) {
-    if (!isAuthenticated()) return;
-    const timeoutMins = parseInt(process.env.ORPHAN_TIMEOUT_MINS || '5');
-    for (const orphan of positionsTracker.getOrphans(timeoutMins)) {
-        log('WARN', `Auto-closing orphan: ${orphan.ticker} x${orphan.remainingQuantity}`);
-        const result = await placeSellOrder(orphan.ticker, orphan.remainingQuantity, 'ORPHAN_AUTO_CLOSE', orphan.entryPrice);
-        if (result.success) { positionsTracker.closePosition(orphan.ticker, orphan.entryPrice, 'ORPHAN_AUTO_CLOSE'); await notify(`🔴 AUTO-CLOSED: ${orphan.ticker} x${orphan.remainingQuantity}`, 'error'); }
-    }
-}
-
-function startOrphanCheck(positionsTracker) {
-    if (orphanCheckTimer) clearInterval(orphanCheckTimer);
-    orphanCheckTimer = setInterval(async () => { await checkOrphanPositions(positionsTracker); await closeOrphanPositions(positionsTracker); }, 1 * 60 * 1000);
-    log('INFO', 'Orphan checker started (every 1 min)');
-}
+// ─── Cancel Orders (v1.2.5: raw axios, date range, all statuses) ─
 
 async function cancelOrdersForTicker(ticker) {
-try {
-        // Get all orders from today — no status filter (child orders aren't QUEUED)
+    try {
         const now = new Date();
         const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-        
         const response = await axios.get(`${SCHWAB_API_BASE}/accounts/${getAccountId()}/orders`, {
-            headers: {
-                'Authorization': `Bearer ${tokens.access_token}`,
-                'Accept': 'application/json'
-            },
-            params: {
-                fromEnteredTime: todayStart,
-                toEnteredTime: now.toISOString()
-            },
-            httpsAgent: keepAliveAgent,
-            timeout: 10000
+            headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Accept': 'application/json' },
+            params: { fromEnteredTime: todayStart, toEnteredTime: now.toISOString() },
+            httpsAgent: keepAliveAgent, timeout: 10000
         });
-        
         const orders = response.data || [];
         let cancelled = 0;
-        
         for (const order of orders) {
             const leg = order.orderLegCollection?.[0];
             const status = order.status;
             const cancelable = ['WORKING', 'QUEUED', 'ACCEPTED', 'PENDING_ACTIVATION'].includes(status);
-            
             if (leg?.instrument?.symbol === ticker && cancelable) {
-                try {
-                    await api.delete(`/accounts/${getAccountId()}/orders/${order.orderId}`);
-                    cancelled++;
-                    log('ORDER', `Cancelled order ${order.orderId} (${status}) for ${ticker}`);
-                } catch (delErr) {
-                    log('WARN', `Failed to cancel order ${order.orderId}: ${delErr.response?.status}`);
-                }
+                try { await api.delete(`/accounts/${getAccountId()}/orders/${order.orderId}`); cancelled++; log('ORDER', `Cancelled ${order.orderId} (${status}) for ${ticker}`); }
+                catch (e) { log('WARN', `Cancel ${order.orderId} failed: ${e.response?.status}`); }
             }
         }
-        
         if (cancelled > 0) log('ORDER', `Cancelled ${cancelled} orders for ${ticker}`);
-        else log('DEBUG', `No cancelable orders found for ${ticker}`);
+        else log('DEBUG', `No cancelable orders for ${ticker}`);
         return cancelled;
-    } catch (err) {
-        log('WARN', `Cancel orders failed (${err.response?.status}): ${err.message}`);
-        return 0;
+    } catch (err) { log('WARN', `Cancel orders: ${err.response?.status || err.message}`); return 0; }
+}
+
+// ─── Orphan Safety ─────────────────────────────────────────────
+async function checkOrphanPositions(pt) {
+    if (!isAuthenticated() || !accountHash) return;
+    try {
+        const schwab = await getPositionsFromSchwab();
+        for (const pos of schwab) {
+            const sym = pos.instrument?.symbol, qty = pos.longQuantity || 0;
+            if (!sym || qty <= 0) continue;
+            if (!pt.getPosition(sym)) {
+                const avg = pos.averagePrice || 0;
+                log('WARN', `ORPHAN: ${sym} x${qty} @ $${avg.toFixed(2)}`);
+                await notify(`⚠️ ORPHAN: ${sym} x${qty} @ $${avg.toFixed(2)}`, 'error');
+                pt.openPosition(sym, avg, qty); pt.markOrphan(sym);
+            }
+        }
+    } catch (err) { log('DEBUG', `Orphan: ${err.message}`); }
+}
+
+async function closeOrphanPositions(pt) {
+    if (!isAuthenticated()) return;
+    const mins = parseInt(process.env.ORPHAN_TIMEOUT_MINS || '5');
+    for (const o of pt.getOrphans(mins)) {
+        log('WARN', `Auto-closing orphan: ${o.ticker} x${o.remainingQuantity}`);
+        const r = await placeSellOrder(o.ticker, o.remainingQuantity, 'ORPHAN_AUTO_CLOSE', o.entryPrice);
+        if (r.success) { pt.closePosition(o.ticker, o.entryPrice, 'ORPHAN_AUTO_CLOSE'); await notify(`🔴 AUTO-CLOSED: ${o.ticker} x${o.remainingQuantity}`, 'error'); }
     }
+}
+
+function startOrphanCheck(pt) {
+    if (orphanCheckTimer) clearInterval(orphanCheckTimer);
+    orphanCheckTimer = setInterval(async () => { await checkOrphanPositions(pt); await closeOrphanPositions(pt); }, 60 * 1000);
+    log('INFO', 'Orphan checker started (1 min)');
 }
 
 const schwabService = {
     getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh, isAuthenticated, getTokenStatus,
-    placeBuyOrder, placeSellOrder, placeBracketOrder, getPositionsFromSchwab, cancelOrdersForTicker,
+    placeBuyOrder, placeSellOrder, getPositionsFromSchwab, cancelOrdersForTicker,
     getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId,
     isRegularHours, getSessionType, checkOrphanPositions, closeOrphanPositions, startOrphanCheck
 };

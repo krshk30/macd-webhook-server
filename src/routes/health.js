@@ -5,13 +5,12 @@ const router = express.Router();
 const startedAt = new Date().toISOString();
 router.get('/health', (req, res) => {
     res.status(schwabService.isAuthenticated() ? 200 : 503).json({
-        status: 'ok', version: '1.2.4', uptime: process.uptime().toFixed(0) + 's', startedAt,
+        status: 'ok', version: '1.2.5', uptime: process.uptime().toFixed(0) + 's', startedAt,
         schwab: { authenticated: schwabService.isAuthenticated(), tokenStatus: schwabService.getTokenStatus(), accountHash: schwabService.getAccountHash() ? 'available' : 'not_fetched', session: schwabService.getSessionType() },
         trading: positions.getStatus(),
-        config: { defaultQuantity: process.env.DEFAULT_QUANTITY || '10', tpCents: process.env.TP_CENTS || '0.08', slCents: process.env.SL_CENTS || '0.05',
-            tradingHours: `${process.env.TRADING_START_HOUR || '7'}:00-${process.env.TRADING_END_HOUR || '18'}:00 ET`, orphanTimeout: (process.env.ORPHAN_TIMEOUT_MINS || '5') + ' mins', orphanInterval: '1 min' }
+        config: { defaultQuantity: process.env.DEFAULT_QUANTITY || '10', tradingHours: `${process.env.TRADING_START_HOUR || '7'}:00-${process.env.TRADING_END_HOUR || '18'}:00 ET`, orphanTimeout: (process.env.ORPHAN_TIMEOUT_MINS || '5') + ' mins' }
     });
 });
 router.get('/positions', (req, res) => res.json(positions.getStatus()));
-router.get('/', (req, res) => res.json({ service: 'MACD Momentum Webhook', version: '1.2.4', endpoints: { health: '/health', webhook: 'POST /webhook', auth: '/auth/start', debug: '/debug/schwab' } }));
+router.get('/', (req, res) => res.json({ service: 'MACD Momentum Webhook', version: '1.2.5' }));
 module.exports = { healthRouter: router };
