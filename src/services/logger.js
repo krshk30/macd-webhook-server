@@ -1,5 +1,2 @@
-function log(level, message) {
-    const timestamp = new Date().toISOString();
-    setImmediate(() => console.log(`[${timestamp}] [${level}] ${message}`));
-}
+function log(level, message) { const ts = new Date().toISOString(); setImmediate(() => console.log(`[${ts}] [${level}] ${message}`)); }
 module.exports = { log };

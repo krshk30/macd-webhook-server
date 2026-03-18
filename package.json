@@ -1,7 +1,6 @@
 {
   "name": "macd-momentum-webhook",
-  "version": "1.2.5",
-  "description": "TradingView webhook server for MACD Momentum strategy - Schwab Trader API",
+  "version": "1.2.6",
   "main": "src/server.js",
   "scripts": { "start": "node src/server.js" },
   "dependencies": { "express": "^4.21.0", "axios": "^1.7.0", "dotenv": "^16.4.0" },

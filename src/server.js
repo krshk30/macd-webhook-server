@@ -14,9 +14,4 @@ app.use('/', healthRouter);
 app.use('/auth', authRouter);
 app.use('/debug', debugRouter);
 app.use('/', webhookRouter);
-app.listen(PORT, () => {
-    log('INFO', `Server v1.2.5 started on port ${PORT}`);
-    schwabService.startTokenRefresh();
-    const { positions } = require('./services/positions');
-    schwabService.startOrphanCheck(positions);
-});
+app.listen(PORT, () => { log('INFO', `Server v1.2.6 started on port ${PORT}`); schwabService.startTokenRefresh(); const { positions } = require('./services/positions'); schwabService.startOrphanCheck(positions); });
