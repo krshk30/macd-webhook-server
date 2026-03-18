@@ -194,13 +194,31 @@ function startOrphanCheck(positionsTracker) {
 }
 
 async function cancelOrdersForTicker(ticker) {
-    try {
-        const r = await api.get(`/accounts/${getAccountId()}/orders`, { params: { status: 'QUEUED' } });
+try {
+        const response = await axios.get(`${SCHWAB_API_BASE}/accounts/${getAccountId()}/orders`, {
+            headers: {
+                'Authorization': `Bearer ${tokens.access_token}`,
+                'Accept': 'application/json'
+            },
+            params: { status: 'QUEUED' },
+            httpsAgent: keepAliveAgent,
+            timeout: 10000
+        });
+        const orders = response.data || [];
         let cancelled = 0;
-        for (const order of (r.data || [])) { if (order.orderLegCollection?.[0]?.instrument?.symbol === ticker) { await api.delete(`/accounts/${getAccountId()}/orders/${order.orderId}`); cancelled++; } }
+        for (const order of orders) {
+            const leg = order.orderLegCollection?.[0];
+            if (leg?.instrument?.symbol === ticker) {
+                await api.delete(`/accounts/${getAccountId()}/orders/${order.orderId}`);
+                cancelled++;
+            }
+        }
         if (cancelled > 0) log('ORDER', `Cancelled ${cancelled} orders for ${ticker}`);
         return cancelled;
-    } catch (err) { log('DEBUG', `Cancel orders: ${err.response?.status || err.message}`); return 0; }
+    } catch (err) {
+        log('WARN', `Cancel orders failed (${err.response?.status}): ${err.message}`);
+        return 0;
+    }
 }
 
 const schwabService = {
