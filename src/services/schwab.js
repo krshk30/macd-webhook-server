@@ -164,7 +164,7 @@ function getAccountId() {
 
 async function getPositionsFromSchwab() {
     try {
-        const response = await api.get('/accounts');
+        const response = await api.get('/accounts', { params: { fields: 'positions' } });
         const allAccounts = response.data || [];
         const account = allAccounts.find(a => a.securitiesAccount) || allAccounts[0] || {};
         return account?.securitiesAccount?.positions || [];
