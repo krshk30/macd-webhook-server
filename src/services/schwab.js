@@ -195,25 +195,44 @@ function startOrphanCheck(positionsTracker) {
 
 async function cancelOrdersForTicker(ticker) {
 try {
+        // Get all orders from today — no status filter (child orders aren't QUEUED)
+        const now = new Date();
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+        
         const response = await axios.get(`${SCHWAB_API_BASE}/accounts/${getAccountId()}/orders`, {
             headers: {
                 'Authorization': `Bearer ${tokens.access_token}`,
                 'Accept': 'application/json'
             },
-            params: { status: 'QUEUED' },
+            params: {
+                fromEnteredTime: todayStart,
+                toEnteredTime: now.toISOString()
+            },
             httpsAgent: keepAliveAgent,
             timeout: 10000
         });
+        
         const orders = response.data || [];
         let cancelled = 0;
+        
         for (const order of orders) {
             const leg = order.orderLegCollection?.[0];
-            if (leg?.instrument?.symbol === ticker) {
-                await api.delete(`/accounts/${getAccountId()}/orders/${order.orderId}`);
-                cancelled++;
+            const status = order.status;
+            const cancelable = ['WORKING', 'QUEUED', 'ACCEPTED', 'PENDING_ACTIVATION'].includes(status);
+            
+            if (leg?.instrument?.symbol === ticker && cancelable) {
+                try {
+                    await api.delete(`/accounts/${getAccountId()}/orders/${order.orderId}`);
+                    cancelled++;
+                    log('ORDER', `Cancelled order ${order.orderId} (${status}) for ${ticker}`);
+                } catch (delErr) {
+                    log('WARN', `Failed to cancel order ${order.orderId}: ${delErr.response?.status}`);
+                }
             }
         }
+        
         if (cancelled > 0) log('ORDER', `Cancelled ${cancelled} orders for ${ticker}`);
+        else log('DEBUG', `No cancelable orders found for ${ticker}`);
         return cancelled;
     } catch (err) {
         log('WARN', `Cancel orders failed (${err.response?.status}): ${err.message}`);
