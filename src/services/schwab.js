@@ -1,7 +1,3 @@
-/**
- * Schwab Trader API Service v1.2.7
- * v1.2.7: LIMIT price buffer for ext hours (fills faster), verify only on CANCEL_BUY
- */
 const axios = require('axios');
 const { log } = require('./logger');
 const { notify } = require('./notifications');
@@ -11,22 +7,15 @@ const SCHWAB_API_BASE = 'https://api.schwabapi.com/trader/v1';
 const https = require('https');
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
-let accountHash = null, refreshTimer = null, orphanCheckTimer = null;
+let accountHash = null, refreshTimer = null, orphanCheckTimer = null, heartbeatTimer = null;
 const api = axios.create({ baseURL: SCHWAB_API_BASE, httpsAgent: keepAliveAgent, timeout: 5000, headers: { 'Content-Type': 'application/json' } });
 api.interceptors.request.use(c => { if (tokens.access_token) c.headers.Authorization = `Bearer ${tokens.access_token}`; return c; });
 
 function getEasternTime() { return new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })); }
 function isRegularHours() { const et = getEasternTime(); const m = et.getHours() * 60 + et.getMinutes(); return m >= 570 && m < 960; }
 function getSessionType() { return isRegularHours() ? 'NORMAL' : 'SEAMLESS'; }
-
-// v1.2.7: LIMIT price buffer for extended hours
 function getLimitBuffer() { return parseFloat(process.env.LIMIT_BUFFER_CENTS || '0.02'); }
-
-function getOrderType(req, price) {
-    if (isRegularHours()) return req;
-    if (req === 'MARKET' && price > 0) { log('ORDER', `Ext hours — MARKET → LIMIT`); return 'LIMIT'; }
-    return req;
-}
+function getOrderType(req, price) { if (isRegularHours()) return req; if (req === 'MARKET' && price > 0) { log('ORDER', 'Ext hours — MARKET → LIMIT'); return 'LIMIT'; } return req; }
 
 function getAuthUrl() { return `${SCHWAB_AUTH_URL}?response_type=code&client_id=${process.env.SCHWAB_CLIENT_ID}&redirect_uri=${encodeURIComponent(process.env.SCHWAB_CALLBACK_URL)}`; }
 async function exchangeCodeForTokens(code) {
@@ -48,7 +37,6 @@ async function refreshAccessToken() {
 function startTokenRefresh() { if (refreshTimer) clearInterval(refreshTimer); refreshTimer = setInterval(async () => { log('INFO', 'Token refresh...'); await refreshAccessToken(); }, 25 * 60 * 1000); log('INFO', 'Token refresh started (25 min)'); }
 function isAuthenticated() { return tokens.access_token && Date.now() < tokens.expires_at; }
 function getTokenStatus() { if (!tokens.access_token) return 'no_token'; if (Date.now() >= tokens.expires_at) return 'expired'; return `valid (${Math.round((tokens.expires_at - Date.now()) / 60000)}m)`; }
-
 function getAccessToken() { return tokens.access_token; }
 function setAccountHash(h) { accountHash = h; log('INFO', `Hash stored: ${h.substring(0,10)}...`); }
 function getAccountHash() { return accountHash; }
@@ -66,12 +54,6 @@ async function getPositionsFromSchwab() {
     } catch (e) { log('DEBUG', `Positions: ${e.response?.status || e.message}`); return []; }
 }
 
-async function verifyPositionOnSchwab(ticker) {
-    try { const pos = await getPositionsFromSchwab(); const p = pos.find(p => p.instrument?.symbol === ticker); return p?.longQuantity || 0; }
-    catch (e) { log('WARN', `Verify failed ${ticker}: ${e.message}`); return -1; }
-}
-
-// v1.2.7: BUY with price buffer (price + buffer for faster fill)
 async function placeBuyOrder(ticker, quantity, price) {
     const t0 = Date.now(), session = getSessionType(), orderType = getOrderType('MARKET', price);
     const buffer = getLimitBuffer();
@@ -84,7 +66,6 @@ async function placeBuyOrder(ticker, quantity, price) {
     } catch (e) { log('ERROR', `BUY failed: ${e.response?.data?.message || e.message}`); return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 }; }
 }
 
-// v1.2.7: SELL with price buffer (price - buffer for faster fill)
 async function placeSellOrder(ticker, quantity, reason, price) {
     const t0 = Date.now(), session = getSessionType(), orderType = getOrderType('MARKET', price);
     const buffer = getLimitBuffer();
@@ -123,9 +104,34 @@ async function closeOrphanPositions(pt) {
     for (const o of pt.getOrphans(parseInt(process.env.ORPHAN_TIMEOUT_MINS || '5'))) {
         log('WARN', `Auto-closing orphan: ${o.ticker} x${o.remainingQuantity}`);
         const r = await placeSellOrder(o.ticker, o.remainingQuantity, 'ORPHAN_AUTO_CLOSE', o.entryPrice);
-        if (r.success) { pt.closePosition(o.ticker, o.entryPrice, 'ORPHAN_AUTO_CLOSE'); await notify(`🔴 AUTO-CLOSED: ${o.ticker}`, 'error'); }
+        if (r.success) { pt.closePosition(o.ticker, o.entryPrice, 'ORPHAN_AUTO_CLOSE'); await notify(`🔴 AUTO-CLOSED orphan: ${o.ticker}`, 'error'); }
     }
 }
+
+// v1.2.8: Heartbeat checker — closes positions where Pine went silent
+async function checkHeartbeats(pt) {
+    if (!isAuthenticated()) return;
+    const timeout = parseInt(process.env.HEARTBEAT_TIMEOUT_SECS || '90');
+    const expired = pt.getHeartbeatExpired(timeout);
+    for (const pos of expired) {
+        const age = Math.round((Date.now() - pos.lastSignalTime) / 1000);
+        log('WARN', `💔 HEARTBEAT EXPIRED: ${pos.ticker} — no signal for ${age}s (limit: ${timeout}s)`);
+        await cancelOrdersForTicker(pos.ticker);
+        const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HEARTBEAT_EXPIRED', pos.entryPrice);
+        if (result.success) {
+            const summary = pt.closePosition(pos.ticker, pos.entryPrice, 'HEARTBEAT_EXPIRED');
+            await notify(`💔 HEARTBEAT EXPIRED: ${pos.ticker} x${summary.remainingClosed}\nNo signal for ${age}s — BUY likely repainted\nP&L: $${summary.pnl.toFixed(2)}`, 'error');
+        }
+    }
+}
+
 function startOrphanCheck(pt) { if (orphanCheckTimer) clearInterval(orphanCheckTimer); orphanCheckTimer = setInterval(async () => { await checkOrphanPositions(pt); await closeOrphanPositions(pt); }, 60 * 1000); log('INFO', 'Orphan checker started (1 min)'); }
 
-module.exports = { schwabService: { getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh, isAuthenticated, getTokenStatus, placeBuyOrder, placeSellOrder, getPositionsFromSchwab, verifyPositionOnSchwab, cancelOrdersForTicker, getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId, isRegularHours, getSessionType, checkOrphanPositions, closeOrphanPositions, startOrphanCheck } };
+// v1.2.8: Heartbeat checker runs every 30 seconds
+function startHeartbeatCheck(pt) {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = setInterval(async () => { await checkHeartbeats(pt); }, 30 * 1000);
+    log('INFO', `Heartbeat checker started (every 30s, timeout: ${process.env.HEARTBEAT_TIMEOUT_SECS || '90'}s)`);
+}
+
+module.exports = { schwabService: { getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh, isAuthenticated, getTokenStatus, placeBuyOrder, placeSellOrder, getPositionsFromSchwab, cancelOrdersForTicker, getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId, isRegularHours, getSessionType, checkOrphanPositions, closeOrphanPositions, startOrphanCheck, checkHeartbeats, startHeartbeatCheck } };

@@ -1,9 +1,8 @@
 /**
- * Webhook Route v1.2.7
- * - LIMIT price buffer for faster fills in extended hours
- * - Anti-short check ONLY on CANCEL_BUY (not CLOSE/SCALE — those trust tracker)
- * - handleClose zero-quantity guard
- * - No bracket orders
+ * Webhook Route v1.2.8
+ * - HEARTBEAT: Pine sends heartbeat every bar close while in position
+ *   Server tracks lastSignalTime. If no signal for 90s → BUY repainted → auto-close
+ * - No brackets, LIMIT buffer, zero-qty guard
  */
 const express = require('express');
 const { schwabService } = require('../services/schwab');
@@ -19,15 +18,25 @@ router.post('/webhook', async (req, res) => {
     if (!schwabService.isAuthenticated()) { log('ERROR', 'Not authenticated'); return res.status(503).json({ error: 'not_authenticated' }); }
     const { action, ticker, price } = body;
     if (!action || !ticker) return res.status(400).json({ error: 'missing action or ticker' });
+
+    // HEARTBEAT is lightweight — no dedup, no full logging
+    if (action === 'HEARTBEAT') {
+        const pos = positions.getPosition(ticker);
+        if (pos) {
+            positions.touchPosition(ticker);
+            return res.json({ status: 'heartbeat_ok', ticker, remaining: pos.remainingQuantity, serverLatency: Date.now() - t0 });
+        }
+        return res.json({ status: 'heartbeat_no_position', ticker });
+    }
+
     log('WEBHOOK', `Received: ${action} ${ticker} @ $${price || '?'} | Processing...`);
     if (positions.isDuplicate(ticker, action)) return res.json({ status: 'duplicate_filtered', latency: Date.now() - t0 });
     let result;
     try {
         switch (action) {
-            case 'BUY':        result = await handleBuy(ticker, price, body); break;
-            case 'SCALE':      result = await handleScale(ticker, price, body); break;
-            case 'CLOSE':      result = await handleClose(ticker, price, body); break;
-            case 'CANCEL_BUY': result = await handleCancelBuy(ticker, price, body); break;
+            case 'BUY':   result = await handleBuy(ticker, price, body); break;
+            case 'SCALE': result = await handleScale(ticker, price, body); break;
+            case 'CLOSE': result = await handleClose(ticker, price, body); break;
             default: return res.status(400).json({ error: `unknown: ${action}` });
         }
     } catch (err) { log('ERROR', `Webhook: ${err.message}`); result = { success: false, error: err.message }; }
@@ -35,7 +44,6 @@ router.post('/webhook', async (req, res) => {
     res.json({ ...result, serverLatency: Date.now() - t0 });
 });
 
-// ─── BUY (simple order, no bracket) ────────────────────────────
 async function handleBuy(ticker, price, body) {
     const check = positions.canOpenPosition(ticker);
     if (!check.allowed) { log('REJECT', `BUY ${ticker}: ${check.reason}`); return { success: false, rejected: check.reason }; }
@@ -45,31 +53,6 @@ async function handleBuy(ticker, price, body) {
     return { success: result.success, action: 'BUY', ticker, quantity: qty, entryPrice, orderId: result.orderId, schwabLatency: result.latency, session: schwabService.getSessionType(), path: body.path || 'unknown' };
 }
 
-// ─── CANCEL_BUY (repaint detected — verify before selling) ─────
-async function handleCancelBuy(ticker, price, body) {
-    const pos = positions.getPosition(ticker);
-    if (!pos) { log('INFO', `CANCEL_BUY ${ticker}: no position`); return { success: true, action: 'CANCEL_BUY', reason: 'no_position' }; }
-    const exitPrice = parseFloat(price) || pos.entryPrice;
-    log('WARN', `⚠️ REPAINT DETECTED: ${ticker} — verifying Schwab position...`);
-
-    // Only CANCEL_BUY verifies Schwab — BUY may not have filled yet
-    const actualQty = await schwabService.verifyPositionOnSchwab(ticker);
-    if (actualQty <= 0) {
-        log('WARN', `CANCEL_BUY ${ticker}: no shares on Schwab — cancelling unfilled BUY order`);
-        await schwabService.cancelOrdersForTicker(ticker);
-        positions.closePosition(ticker, exitPrice, 'REPAINT_BUY_CANCELLED');
-        return { success: true, action: 'CANCEL_BUY', ticker, reason: 'buy_not_filled_cancelled', sharesClosed: 0 };
-    }
-
-    const sellQty = Math.min(pos.remainingQuantity, actualQty);
-    await schwabService.cancelOrdersForTicker(ticker);
-    const result = await schwabService.placeSellOrder(ticker, sellQty, 'REPAINT_CANCEL', exitPrice);
-    const summary = positions.closePosition(ticker, exitPrice, 'REPAINT_CANCEL');
-    await notify(`⚠️ REPAINT CANCEL: ${ticker} x${sellQty}\nP&L: $${summary.pnl.toFixed(2)}`, 'error');
-    return { success: result.success, action: 'CANCEL_BUY', ticker, sharesClosed: sellQty, pnl: summary.pnl.toFixed(2), schwabLatency: result.latency };
-}
-
-// ─── SCALE (trust tracker — no Schwab verification) ────────────
 async function handleScale(ticker, price, body) {
     const pos = positions.getPosition(ticker);
     if (!pos) { log('REJECT', `SCALE ${ticker}: no position`); return { success: false, rejected: 'no position' }; }
@@ -81,19 +64,11 @@ async function handleScale(ticker, price, body) {
     return { success: result.success, action: 'SCALE', ticker, level, sharesSold: scaleResult.sharesToSell, remaining: pos.remainingQuantity, scalePnL: scaleResult.pnl.toFixed(2), schwabLatency: result.latency };
 }
 
-// ─── CLOSE (trust tracker — no Schwab verification) ────────────
 async function handleClose(ticker, price, body) {
     const pos = positions.getPosition(ticker);
     if (!pos) { log('REJECT', `CLOSE ${ticker}: no position`); return { success: false, rejected: 'no position' }; }
     const exitPrice = parseFloat(price) || 0, reason = body.reason || 'unknown';
-
-    // Zero-quantity guard: if all shares already scaled out
-    if (pos.remainingQuantity <= 0) {
-        log('INFO', `CLOSE ${ticker}: fully scaled out — cleaning tracker`);
-        const summary = positions.closePosition(ticker, exitPrice, 'all_scaled_out');
-        return { success: true, action: 'CLOSE', ticker, reason: 'all_scaled_out', sharesClosed: 0, pnl: summary ? summary.pnl.toFixed(2) : '0.00' };
-    }
-
+    if (pos.remainingQuantity <= 0) { log('INFO', `CLOSE ${ticker}: fully scaled out`); const s = positions.closePosition(ticker, exitPrice, 'all_scaled_out'); return { success: true, action: 'CLOSE', ticker, reason: 'all_scaled_out', sharesClosed: 0, pnl: s ? s.pnl.toFixed(2) : '0.00' }; }
     await schwabService.cancelOrdersForTicker(ticker);
     const result = await schwabService.placeSellOrder(ticker, pos.remainingQuantity, `Close: ${reason}`, exitPrice);
     const summary = positions.closePosition(ticker, exitPrice, reason);
