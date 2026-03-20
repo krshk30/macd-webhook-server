@@ -24,4 +24,5 @@ app.listen(PORT, () => {
     const { positions } = require('./services/positions');
     schwabService.startOrphanCheck(positions);
     schwabService.startHeartbeatCheck(positions);
+    schwabService.startFloorMonitor(positions);
 });

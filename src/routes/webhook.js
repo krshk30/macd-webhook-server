@@ -34,58 +34,14 @@ router.post('/webhook', async (req, res) => {
         const pos = positions.getPosition(ticker);
         if (pos) {
             positions.touchPosition(ticker);
-
-            // v1.3.0: Skip stop ratcheting if position is being closed
-            if (pos.isClosing) {
-                return res.json({
-                    status: 'heartbeat_ok_closing',
-                    ticker,
-                    tradeId: pos.tradeId,
-                    serverLatency: Date.now() - t0
-                });
-            }
-
-            // v1.3.0: Ratchet stop loss based on floor from Pine
-            const floorPrice = parseFloat(body.floorPrice) || 0;
-            const currentStop = positions.getStopPrice(ticker);
-            let stopUpdated = false;
-
-            // Fallback: if no stop exists yet (initial failed), place one now
-            if (currentStop === 0) {
-                const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
-                const fallbackStop = floorPrice > 0 ? floorPrice : pos.entryPrice - stopCents;
-                if (fallbackStop > 0) {
-                    const stopResult = await schwabService.placeStopOrder(
-                        ticker, pos.remainingQuantity, fallbackStop
-                    );
-                    if (stopResult.success) {
-                        positions.updateStopPrice(ticker, fallbackStop, stopResult.orderId);
-                        stopUpdated = true;
-                        log('STOP', `Fallback stop placed for ${ticker} @ $${fallbackStop.toFixed(2)}`);
-                    }
-                }
-            } else if (floorPrice > 0 && floorPrice > currentStop) {
-                // Floor has increased — cancel old stop, place new one
-                const oldStopId = positions.getStopOrderId(ticker);
-                if (oldStopId) {
-                    await schwabService.cancelOrder(oldStopId);
-                }
-                const stopResult = await schwabService.placeStopOrder(
-                    ticker, pos.remainingQuantity, floorPrice
-                );
-                if (stopResult.success) {
-                    positions.updateStopPrice(ticker, floorPrice, stopResult.orderId);
-                    stopUpdated = true;
-                }
-            }
-
+            // v1.3.0: Stop ratcheting handled by floor monitor (5s interval)
+            // Heartbeat only proves Pine is still tracking this position
             return res.json({
                 status: 'heartbeat_ok',
                 ticker,
                 tradeId: pos.tradeId,
                 remaining: pos.remainingQuantity,
                 currentStop: positions.getStopPrice(ticker),
-                stopUpdated,
                 tier: body.tier,
                 profitPct: body.profitPct,
                 serverLatency: Date.now() - t0
@@ -131,46 +87,16 @@ async function handleBuy(ticker, price, body) {
 
     const qty = DEFAULT_QTY();
     const entryPrice = parseFloat(price) || 0;
-    let actualFillPrice = entryPrice;
-    let stopPlacedAt = 0;
 
+    // v1.3.0: Single TRIGGER order — BUY fills → child STOP activates
+    // No delay, no separate stop call, no race condition
     const result = await schwabService.placeBuyOrder(ticker, qty, entryPrice);
 
     if (result.success) {
-        // v1.3.0: pass full body so position stores entry indicators
         positions.openPosition(ticker, entryPrice, qty, body);
-
-        // v1.3.0: Place initial stop loss (2¢ below ACTUAL fill price)
-        // Wait 2s for BUY to fill on Schwab before placing stop
-        await new Promise(r => setTimeout(r, 2000));
-
-        // Get actual fill price from Schwab (not Pine signal price)
-        if (result.orderId) {
-            const fillPrice = await schwabService.getOrderFillPrice(result.orderId);
-            if (fillPrice > 0) {
-                actualFillPrice = fillPrice;
-                log('INFO', `${ticker}: signal $${entryPrice.toFixed(2)} → filled $${actualFillPrice.toFixed(2)}`);
-                // Update position with real fill price
-                const pos = positions.getPosition(ticker);
-                if (pos) {
-                    pos.entryPrice = actualFillPrice;
-                    pos.entryData.signalPrice = entryPrice;
-                    pos.entryData.fillPrice = actualFillPrice;
-                }
-            }
-        }
-
-        const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
-        stopPlacedAt = actualFillPrice - stopCents;
-        if (stopPlacedAt > 0) {
-            const stopResult = await schwabService.placeStopOrder(ticker, qty, stopPlacedAt);
-            if (stopResult.success) {
-                positions.setStopOrder(ticker, stopResult.orderId, stopPlacedAt);
-            } else {
-                log('WARN', `Stop order failed for ${ticker} — will retry on heartbeat`, {
-                    stopPrice: stopPlacedAt.toFixed(2), error: stopResult.error
-                });
-            }
+        // Record the stop price from the TRIGGER order
+        if (result.stopPrice) {
+            positions.setStopOrder(ticker, null, result.stopPrice);
         }
     }
 
@@ -182,8 +108,7 @@ async function handleBuy(ticker, price, body) {
         ticker,
         quantity: qty,
         signalPrice: entryPrice,
-        fillPrice: actualFillPrice,
-        stopPrice: stopPlacedAt,
+        stopPrice: result.stopPrice || 0,
         orderId: result.orderId,
         schwabLatency: result.latency,
         session: schwabService.getSessionType(),
@@ -203,11 +128,13 @@ async function handleScale(ticker, price, body) {
     const sellPct = parseInt(body.sell_pct) || 50;
     const currentPrice = parseFloat(price) || 0;
 
-    // v1.3.0: Cancel existing stop BEFORE selling (prevents overselling)
+    // Cancel existing stop BEFORE placing new TRIGGER order
     const oldStopId = positions.getStopOrderId(ticker);
     if (oldStopId) {
         await schwabService.cancelOrder(oldStopId);
     }
+    // Also cancel any other lingering orders
+    await schwabService.cancelOrdersForTicker(ticker);
 
     positions.markMilestone(ticker, level);
     const scaleResult = positions.scalePosition(ticker, sellPct, level, currentPrice);
@@ -216,7 +143,7 @@ async function handleScale(ticker, price, body) {
         log('WARN', `SCALE ${ticker}: nothing to sell`, {
             tradeId: pos.tradeId, level, sellPct, remaining: pos.remainingQuantity
         });
-        // Re-place stop if we cancelled it but didn't sell
+        // Re-place stop since we cancelled it
         const currentStop = positions.getStopPrice(ticker);
         if (currentStop > 0 && pos.remainingQuantity > 0) {
             const stopResult = await schwabService.placeStopOrder(ticker, pos.remainingQuantity, currentStop);
@@ -225,23 +152,26 @@ async function handleScale(ticker, price, body) {
         return { success: false, rejected: 'nothing to sell' };
     }
 
-    const result = await schwabService.placeSellOrder(
-        ticker, scaleResult.sharesToSell,
-        `Scale ${level} (${sellPct}%)`, currentPrice
-    );
-
-    // v1.3.0: Place new stop for REMAINING shares at current floor
     const updatedPos = positions.getPosition(ticker);
-    if (updatedPos && updatedPos.remainingQuantity > 0) {
-        const currentStop = positions.getStopPrice(ticker);
-        if (currentStop > 0) {
-            const stopResult = await schwabService.placeStopOrder(
-                ticker, updatedPos.remainingQuantity, currentStop
-            );
-            if (stopResult.success) {
-                positions.updateStopPrice(ticker, currentStop, stopResult.orderId);
-            }
+    const remaining = updatedPos ? updatedPos.remainingQuantity : 0;
+    const currentStop = positions.getStopPrice(ticker) || (pos.entryPrice - parseFloat(process.env.STOP_LOSS_CENTS || '0.02'));
+    let result;
+
+    if (remaining > 0) {
+        // v1.3.0: SELL+STOP TRIGGER — sell scale shares, child STOP for remaining
+        result = await schwabService.placeSellWithStop(
+            ticker, scaleResult.sharesToSell, remaining,
+            `Scale ${level} (${sellPct}%)`, currentPrice, currentStop
+        );
+        if (result.success) {
+            positions.updateStopPrice(ticker, currentStop, null);
         }
+    } else {
+        // Selling everything — no child stop needed
+        result = await schwabService.placeSellOrder(
+            ticker, scaleResult.sharesToSell,
+            `Scale ${level} (${sellPct}%)`, currentPrice
+        );
     }
 
     return {
@@ -250,9 +180,9 @@ async function handleScale(ticker, price, body) {
         tradeId: pos.tradeId,
         ticker, level,
         sharesSold: scaleResult.sharesToSell,
-        remaining: updatedPos ? updatedPos.remainingQuantity : 0,
+        remaining,
         scalePnL: scaleResult.pnl.toFixed(2),
-        currentStop: positions.getStopPrice(ticker),
+        currentStop,
         schwabLatency: result.latency
     };
 }

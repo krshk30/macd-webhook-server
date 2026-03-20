@@ -186,26 +186,134 @@ async function getOrderFillPrice(orderId) {
     }
 }
 
+// v1.3.0: BUY + STOP in one TRIGGER order
+// Schwab activates the child STOP automatically after BUY fills
 async function placeBuyOrder(ticker, quantity, price) {
-    const t0 = Date.now(), session = getSessionType(), orderType = getOrderType('MARKET', price);
+    const t0 = Date.now(), session = getSessionType();
+    const buyOrderType = getOrderType('MARKET', price);
     const buffer = getLimitBuffer();
-    const limitPrice = orderType === 'LIMIT' && price > 0 ? price + buffer : price;
-    const order = {
-        orderType, session, duration: 'DAY', orderStrategyType: 'SINGLE',
-        orderLegCollection: [{ instruction: 'BUY', quantity, instrument: { symbol: ticker, assetType: 'EQUITY' } }]
+    const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
+    const stopPrice = parseFloat((price - stopCents).toFixed(2));
+
+    // Child STOP order — activates after BUY fills
+    const childStop = {
+        orderStrategyType: 'SINGLE',
+        orderType: 'STOP',
+        stopPrice: stopPrice,
+        session,
+        duration: 'DAY',
+        orderLegCollection: [{
+            instruction: 'SELL', quantity,
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
+        }]
     };
-    if (orderType === 'LIMIT' && limitPrice > 0) {
-        order.price = limitPrice.toFixed(2);
-        log('ORDER', `BUY LIMIT @ $${limitPrice.toFixed(2)}`, { signal: price, buffer });
+
+    // Extended hours: child stop must be STOP_LIMIT
+    if (!isRegularHours()) {
+        childStop.orderType = 'STOP_LIMIT';
+        childStop.price = parseFloat((stopPrice - buffer).toFixed(2));
     }
+
+    // Parent TRIGGER order
+    const order = {
+        orderStrategyType: 'TRIGGER',
+        orderType: buyOrderType,
+        session,
+        duration: 'DAY',
+        orderLegCollection: [{
+            instruction: 'BUY', quantity,
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
+        }],
+        childOrderStrategies: [childStop]
+    };
+
+    // BUY LIMIT for extended hours
+    if (buyOrderType === 'LIMIT' && price > 0) {
+        order.price = parseFloat((price + buffer).toFixed(2));
+    }
+
+    log('ORDER', `BUY+STOP ${quantity} ${ticker}`, {
+        buyType: buyOrderType, stopPrice, session, signalPrice: price
+    });
+
     try {
         const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
         const lat = Date.now() - t0, oid = r.headers.location?.split('/').pop();
-        log('ORDER', `BUY ${quantity} ${ticker}`, { orderType, session, latency: lat, orderId: oid });
-        await notify(`BUY ${quantity} ${ticker} | ${orderType} ${session} | ${lat}ms`, 'buy');
-        return { success: true, orderId: oid, latency: lat };
+        log('ORDER', `BUY+STOP placed ${quantity} ${ticker}`, {
+            orderId: oid, stopPrice, session, latency: lat
+        });
+        await notify(`BUY ${quantity} ${ticker} + STOP $${stopPrice} | ${buyOrderType} ${session} | ${lat}ms`, 'buy');
+        return { success: true, orderId: oid, latency: lat, stopPrice };
     } catch (e) {
-        log('ERROR', `BUY failed: ${ticker}`, { error: e.response?.data?.message || e.message });
+        log('ERROR', `BUY+STOP failed: ${ticker}`, {
+            error: e.response?.data?.message || e.message,
+            statusCode: e.response?.status
+        });
+        return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 };
+    }
+}
+
+// v1.3.0: SELL + child STOP in one TRIGGER order (for SCALE exits)
+// Sells partial shares, child STOP for remaining activates after sell fills
+async function placeSellWithStop(ticker, sellQty, remainingQty, reason, price, stopPrice) {
+    const t0 = Date.now(), session = getSessionType();
+    const sellOrderType = getOrderType('MARKET', price);
+    const buffer = getLimitBuffer();
+
+    // Child STOP for remaining shares
+    const childStop = {
+        orderStrategyType: 'SINGLE',
+        orderType: 'STOP',
+        stopPrice: parseFloat(stopPrice.toFixed(2)),
+        session,
+        duration: 'DAY',
+        orderLegCollection: [{
+            instruction: 'SELL', quantity: remainingQty,
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
+        }]
+    };
+
+    // Extended hours: STOP_LIMIT
+    if (!isRegularHours()) {
+        childStop.orderType = 'STOP_LIMIT';
+        childStop.price = parseFloat((stopPrice - buffer).toFixed(2));
+    }
+
+    // Parent TRIGGER: SELL (scale) → child STOP (remaining)
+    const order = {
+        orderStrategyType: 'TRIGGER',
+        orderType: sellOrderType,
+        session,
+        duration: 'DAY',
+        orderLegCollection: [{
+            instruction: 'SELL', quantity: sellQty,
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
+        }],
+        childOrderStrategies: [childStop]
+    };
+
+    // SELL LIMIT for extended hours
+    if (sellOrderType === 'LIMIT' && price > 0) {
+        order.price = parseFloat((price - buffer).toFixed(2));
+    }
+
+    log('ORDER', `SELL+STOP ${sellQty} ${ticker} (${reason})`, {
+        sellType: sellOrderType, remaining: remainingQty,
+        stopPrice: stopPrice.toFixed(2), session
+    });
+
+    try {
+        const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
+        const lat = Date.now() - t0;
+        log('ORDER', `SELL+STOP placed ${sellQty} ${ticker} (${reason})`, {
+            remaining: remainingQty, stopPrice: stopPrice.toFixed(2), latency: lat
+        });
+        await notify(`SELL ${sellQty} ${ticker} (${reason}) + STOP ${remainingQty} @ $${stopPrice.toFixed(2)} | ${lat}ms`, 'sell');
+        return { success: true, latency: lat };
+    } catch (e) {
+        log('ERROR', `SELL+STOP failed: ${ticker}`, {
+            error: e.response?.data?.message || e.message, reason
+        });
         return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 };
     }
 }
@@ -235,9 +343,22 @@ async function placeSellOrder(ticker, quantity, reason, price) {
 }
 
 // v1.3.0: Place a STOP LOSS order (safety net on TOS)
+// If current price is already at/below stop → sell at market immediately
+// If stop is rejected → sell at market (price already at stop level)
 async function placeStopOrder(ticker, quantity, stopPrice) {
     const t0 = Date.now(), session = getSessionType();
     const buffer = getLimitBuffer();
+
+    // First check: is the current price already at or below the stop?
+    // If so, a stop order would be rejected — sell at market instead
+    const currentPrice = await getCurrentPrice(ticker);
+    if (currentPrice > 0 && currentPrice <= stopPrice) {
+        log('STOP', `Price $${currentPrice.toFixed(2)} already at/below stop $${stopPrice.toFixed(2)} — selling at market`, {
+            ticker, quantity
+        });
+        const sellResult = await placeSellOrder(ticker, quantity, 'STOP_IMMEDIATE', currentPrice);
+        return { success: sellResult.success, orderId: null, latency: Date.now() - t0, immediate: true };
+    }
 
     // Regular hours: STOP order (becomes market when triggered)
     // Extended hours: STOP_LIMIT (must have limit price for SEAMLESS session)
@@ -249,7 +370,7 @@ async function placeStopOrder(ticker, quantity, stopPrice) {
         session,
         duration: 'DAY',
         orderStrategyType: 'SINGLE',
-        stopPrice: parseFloat(stopPrice.toFixed(2)),  // MUST be number, not string
+        stopPrice: parseFloat(stopPrice.toFixed(2)),
         orderLegCollection: [{
             instruction: 'SELL',
             quantity,
@@ -257,16 +378,14 @@ async function placeStopOrder(ticker, quantity, stopPrice) {
         }]
     };
 
-    // STOP_LIMIT needs a limit price below the stop
     if (useStopLimit) {
-        order.price = parseFloat((stopPrice - buffer).toFixed(2));  // number
+        order.price = parseFloat((stopPrice - buffer).toFixed(2));
     }
 
     log('STOP', `Submitting ${orderType} ${quantity} ${ticker}`, {
         stopPrice: order.stopPrice,
-        limitPrice: order.price || null,
-        session,
-        orderBody: JSON.stringify(order)
+        currentBid: currentPrice,
+        session
     });
 
     try {
@@ -278,15 +397,21 @@ async function placeStopOrder(ticker, quantity, stopPrice) {
         });
         return { success: true, orderId, latency: lat };
     } catch (e) {
-        const errData = e.response?.data;
-        log('ERROR', `STOP failed: ${ticker}`, {
-            error: e.response?.data?.message || e.message,
+        const errMsg = e.response?.data?.message || e.message || '';
+        log('ERROR', `STOP rejected: ${ticker}`, {
+            error: errMsg,
             statusCode: e.response?.status,
-            responseBody: errData ? JSON.stringify(errData) : null,
-            stopPrice: stopPrice.toFixed(2),
-            orderSent: JSON.stringify(order)
+            stopPrice: stopPrice.toFixed(2)
         });
-        return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 };
+
+        // If rejected because price is at/below stop → sell at market
+        if (errMsg.toLowerCase().includes('stop price') || errMsg.toLowerCase().includes('below the bid')) {
+            log('STOP', `Stop rejected — price at stop level, selling at market`, { ticker, quantity });
+            const sellResult = await placeSellOrder(ticker, quantity, 'STOP_REJECTED_SELL', stopPrice);
+            return { success: sellResult.success, orderId: null, latency: Date.now() - t0, immediate: true };
+        }
+
+        return { success: false, error: errMsg, latency: Date.now() - t0 };
     }
 }
 
@@ -435,15 +560,119 @@ function startHeartbeatCheck(pt) {
     log('INFO', `Heartbeat checker started (30s, timeout: ${process.env.HEARTBEAT_TIMEOUT_SECS || '60'}s)`);
 }
 
+// v1.3.0: Floor monitor — checks price every 5s against profit floor
+// Replicates Pine's floor logic server-side so we don't wait for heartbeat
+let floorMonitorTimer = null;
+
+function calculateFloor(profitPct) {
+    // Mirror Pine's floor milestones exactly
+    const FLOOR_AT_1 = parseFloat(process.env.FLOOR_AT_1PCT || '0');
+    const FLOOR_AT_2 = parseFloat(process.env.FLOOR_AT_2PCT || '0.5');
+    const FLOOR_AT_3 = parseFloat(process.env.FLOOR_AT_3PCT || '1.5');
+    const FLOOR_AT_4 = parseFloat(process.env.FLOOR_AT_4PCT || '2.5');
+    const TRAIL_GAP  = parseFloat(process.env.FLOOR_TRAIL_GAP || '1.5');
+
+    if (profitPct >= 4) return Math.max(FLOOR_AT_4, profitPct - TRAIL_GAP);
+    if (profitPct >= 3) return FLOOR_AT_3;
+    if (profitPct >= 2) return FLOOR_AT_2;
+    if (profitPct >= 1) return FLOOR_AT_1;
+    return -999; // no floor yet
+}
+
+async function checkFloors(pt) {
+    if (!isAuthenticated()) return;
+    const allPositions = pt.getAllPositions();
+    if (allPositions.length === 0) return;
+
+    for (const pos of allPositions) {
+        if (!pos.remainingQuantity || pos.remainingQuantity <= 0) continue;
+        if (pos.isClosing || pos.isOrphan) continue;
+
+        // Fetch current price
+        const currentPrice = await getCurrentPrice(pos.ticker);
+        if (currentPrice <= 0) continue;
+
+        const profitPct = (currentPrice - pos.entryPrice) / pos.entryPrice * 100;
+        const floorPct = calculateFloor(profitPct);
+
+        // No floor active yet
+        if (floorPct <= -999) continue;
+
+        const floorPrice = pos.entryPrice * (1 + floorPct / 100);
+        const currentStop = pos.currentStopPrice || 0;
+
+        // Check if price breached the floor — emergency sell
+        if (currentPrice <= floorPrice && floorPct >= 0) {
+            log('FLOOR', `🚨 FLOOR BREACH (server): ${pos.ticker} price $${currentPrice.toFixed(2)} <= floor $${floorPrice.toFixed(2)}`, {
+                tradeId: pos.tradeId, profitPct: profitPct.toFixed(2), floorPct: floorPct.toFixed(2)
+            });
+            pos.isClosing = true;
+            if (pos.stopOrderId) {
+                await cancelOrder(pos.stopOrderId);
+            }
+            await cancelOrdersForTicker(pos.ticker);
+            await new Promise(r => setTimeout(r, 300));
+            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'SERVER_FLOOR_BREACH', currentPrice);
+            if (result.success) {
+                journalTrade({
+                    action: 'SERVER_FLOOR_BREACH',
+                    tradeId: pos.tradeId,
+                    ticker: pos.ticker,
+                    entryPrice: pos.entryPrice,
+                    sellPrice: currentPrice,
+                    floorPrice,
+                    floorPct: floorPct.toFixed(2),
+                    profitPct: profitPct.toFixed(2)
+                });
+                const summary = pt.closePosition(pos.ticker, currentPrice, 'SERVER_FLOOR_BREACH');
+                if (summary) {
+                    await notify(
+                        `🚨 SERVER FLOOR BREACH: ${pos.ticker}\n` +
+                        `TradeID: ${summary.tradeId}\n` +
+                        `Price $${currentPrice.toFixed(2)} hit floor $${floorPrice.toFixed(2)}\n` +
+                        `P&L: $${summary.pnl.toFixed(2)} | Total: $${summary.totalPnL.toFixed(2)}`,
+                        summary.totalPnL >= 0 ? 'profit' : 'loss'
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Ratchet stop up if floor increased
+        if (floorPrice > currentStop) {
+            log('FLOOR', `Ratcheting stop for ${pos.ticker}: $${currentStop.toFixed(2)} → $${floorPrice.toFixed(2)}`, {
+                tradeId: pos.tradeId, profitPct: profitPct.toFixed(2), floorPct: floorPct.toFixed(2)
+            });
+            if (pos.stopOrderId) {
+                await cancelOrder(pos.stopOrderId);
+            }
+            const stopResult = await placeStopOrder(pos.ticker, pos.remainingQuantity, floorPrice);
+            if (stopResult.success) {
+                pt.updateStopPrice(pos.ticker, floorPrice, stopResult.orderId);
+            }
+        }
+    }
+}
+
+function startFloorMonitor(pt) {
+    if (floorMonitorTimer) clearInterval(floorMonitorTimer);
+    const intervalSecs = parseInt(process.env.FLOOR_CHECK_INTERVAL_SECS || '5');
+    floorMonitorTimer = setInterval(async () => {
+        await checkFloors(pt);
+    }, intervalSecs * 1000);
+    log('INFO', `Floor monitor started (${intervalSecs}s)`);
+}
+
 module.exports = {
     schwabService: {
         getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh,
         isAuthenticated, getTokenStatus, placeBuyOrder, placeSellOrder,
-        placeStopOrder, cancelOrder, getOrderFillPrice,
+        placeSellWithStop, placeStopOrder, cancelOrder, getOrderFillPrice,
         getPositionsFromSchwab, getCurrentPrice, cancelOrdersForTicker,
         getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId,
         isRegularHours, getSessionType,
         checkOrphanPositions, closeOrphanPositions, startOrphanCheck,
-        checkHeartbeats, startHeartbeatCheck
+        checkHeartbeats, startHeartbeatCheck,
+        checkFloors, startFloorMonitor
     }
 };

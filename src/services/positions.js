@@ -379,6 +379,10 @@ function markMilestone(ticker, m) {
 }
 
 // --- Status ---
+function getAllPositions() {
+    return Array.from(positions.values());
+}
+
 function getStatus() {
     resetDailyIfNeeded();
     return {
@@ -406,6 +410,6 @@ module.exports = {
         isDuplicate, canOpenPosition, openPosition, getPosition,
         touchPosition, setStopOrder, getStopPrice, getStopOrderId, updateStopPrice,
         getHeartbeatExpired, scalePosition, closePosition,
-        markMilestone, getStatus, markOrphan, getOrphans
+        markMilestone, getStatus, getAllPositions, markOrphan, getOrphans
     }
 };
