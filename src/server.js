@@ -6,16 +6,20 @@ const { healthRouter } = require('./routes/health');
 const { debugRouter } = require('./routes/debug');
 const { schwabService } = require('./services/schwab');
 const { log } = require('./services/logger');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+
 app.use(express.json({ limit: '10kb' }));
 app.set('trust proxy', 1);
+
 app.use('/', healthRouter);
 app.use('/auth', authRouter);
 app.use('/debug', debugRouter);
 app.use('/', webhookRouter);
+
 app.listen(PORT, () => {
-    log('INFO', `Server v1.2.8 started on port ${PORT}`);
+    log('INFO', `Server v1.3.0 started on port ${PORT}`);
     schwabService.startTokenRefresh();
     const { positions } = require('./services/positions');
     schwabService.startOrphanCheck(positions);
