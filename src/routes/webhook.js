@@ -121,6 +121,8 @@ async function handleBuy(ticker, price, body) {
 
     const qty = DEFAULT_QTY();
     const entryPrice = parseFloat(price) || 0;
+    let actualFillPrice = entryPrice;
+    let stopPlacedAt = 0;
 
     const result = await schwabService.placeBuyOrder(ticker, qty, entryPrice);
 
@@ -128,18 +130,35 @@ async function handleBuy(ticker, price, body) {
         // v1.3.0: pass full body so position stores entry indicators
         positions.openPosition(ticker, entryPrice, qty, body);
 
-        // v1.3.0: Place initial stop loss (2¢ below entry)
+        // v1.3.0: Place initial stop loss (2¢ below ACTUAL fill price)
         // Wait 2s for BUY to fill on Schwab before placing stop
         await new Promise(r => setTimeout(r, 2000));
+
+        // Get actual fill price from Schwab (not Pine signal price)
+        if (result.orderId) {
+            const fillPrice = await schwabService.getOrderFillPrice(result.orderId);
+            if (fillPrice > 0) {
+                actualFillPrice = fillPrice;
+                log('INFO', `${ticker}: signal $${entryPrice.toFixed(2)} → filled $${actualFillPrice.toFixed(2)}`);
+                // Update position with real fill price
+                const pos = positions.getPosition(ticker);
+                if (pos) {
+                    pos.entryPrice = actualFillPrice;
+                    pos.entryData.signalPrice = entryPrice;
+                    pos.entryData.fillPrice = actualFillPrice;
+                }
+            }
+        }
+
         const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
-        const stopPrice = entryPrice - stopCents;
-        if (stopPrice > 0) {
-            const stopResult = await schwabService.placeStopOrder(ticker, qty, stopPrice);
+        stopPlacedAt = actualFillPrice - stopCents;
+        if (stopPlacedAt > 0) {
+            const stopResult = await schwabService.placeStopOrder(ticker, qty, stopPlacedAt);
             if (stopResult.success) {
-                positions.setStopOrder(ticker, stopResult.orderId, stopPrice);
+                positions.setStopOrder(ticker, stopResult.orderId, stopPlacedAt);
             } else {
                 log('WARN', `Stop order failed for ${ticker} — will retry on heartbeat`, {
-                    stopPrice: stopPrice.toFixed(2), error: stopResult.error
+                    stopPrice: stopPlacedAt.toFixed(2), error: stopResult.error
                 });
             }
         }
@@ -152,8 +171,9 @@ async function handleBuy(ticker, price, body) {
         tradeId,
         ticker,
         quantity: qty,
-        entryPrice,
-        stopPrice: entryPrice - parseFloat(process.env.STOP_LOSS_CENTS || '0.02'),
+        signalPrice: entryPrice,
+        fillPrice: actualFillPrice,
+        stopPrice: stopPlacedAt,
         orderId: result.orderId,
         schwabLatency: result.latency,
         session: schwabService.getSessionType(),

@@ -156,6 +156,36 @@ async function getCurrentPrice(ticker) {
     }
 }
 
+// v1.3.0: Get actual fill price from a completed order
+async function getOrderFillPrice(orderId) {
+    if (!orderId) return 0;
+    try {
+        const r = await api.get(`/accounts/${getAccountId()}/orders/${orderId}`);
+        const order = r.data;
+        // Check order activities for fill price
+        const activities = order?.orderActivityCollection || [];
+        for (const act of activities) {
+            const legs = act?.executionLegs || [];
+            for (const leg of legs) {
+                if (leg.price > 0) {
+                    log('INFO', `Order ${orderId} fill price: $${leg.price}`, {
+                        quantity: leg.quantity
+                    });
+                    return leg.price;
+                }
+            }
+        }
+        // Fallback: check if price field exists on order
+        if (order?.price > 0) return order.price;
+        return 0;
+    } catch (e) {
+        log('WARN', `Could not get fill price for order ${orderId}`, {
+            error: e.response?.status || e.message
+        });
+        return 0;
+    }
+}
+
 async function placeBuyOrder(ticker, quantity, price) {
     const t0 = Date.now(), session = getSessionType(), orderType = getOrderType('MARKET', price);
     const buffer = getLimitBuffer();
@@ -388,7 +418,7 @@ module.exports = {
     schwabService: {
         getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh,
         isAuthenticated, getTokenStatus, placeBuyOrder, placeSellOrder,
-        placeStopOrder, cancelOrder,
+        placeStopOrder, cancelOrder, getOrderFillPrice,
         getPositionsFromSchwab, getCurrentPrice, cancelOrdersForTicker,
         getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId,
         isRegularHours, getSessionType,
