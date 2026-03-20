@@ -35,6 +35,16 @@ router.post('/webhook', async (req, res) => {
         if (pos) {
             positions.touchPosition(ticker);
 
+            // v1.3.0: Skip stop ratcheting if position is being closed
+            if (pos.isClosing) {
+                return res.json({
+                    status: 'heartbeat_ok_closing',
+                    ticker,
+                    tradeId: pos.tradeId,
+                    serverLatency: Date.now() - t0
+                });
+            }
+
             // v1.3.0: Ratchet stop loss based on floor from Pine
             const floorPrice = parseFloat(body.floorPrice) || 0;
             const currentStop = positions.getStopPrice(ticker);
@@ -268,7 +278,21 @@ async function handleClose(ticker, price, body) {
         };
     }
 
+    // v1.3.0: Mark position as closing so heartbeat doesn't place new stops
+    pos.isClosing = true;
+
+    // v1.3.0: Cancel the tracked stop order by ID first (fastest)
+    const stopId = positions.getStopOrderId(ticker);
+    if (stopId) {
+        await schwabService.cancelOrder(stopId);
+        log('STOP', `Cancelled stop ${stopId} before CLOSE`, { ticker });
+    }
+
+    // Also cancel any other open orders for this ticker
     await schwabService.cancelOrdersForTicker(ticker);
+
+    // Wait for cancellations to settle on Schwab's side
+    await new Promise(r => setTimeout(r, 500));
 
     const result = await schwabService.placeSellOrder(
         ticker, pos.remainingQuantity,

@@ -249,7 +249,7 @@ async function placeStopOrder(ticker, quantity, stopPrice) {
         session,
         duration: 'DAY',
         orderStrategyType: 'SINGLE',
-        stopPrice: stopPrice.toFixed(2),
+        stopPrice: parseFloat(stopPrice.toFixed(2)),  // MUST be number, not string
         orderLegCollection: [{
             instruction: 'SELL',
             quantity,
@@ -259,8 +259,15 @@ async function placeStopOrder(ticker, quantity, stopPrice) {
 
     // STOP_LIMIT needs a limit price below the stop
     if (useStopLimit) {
-        order.price = (stopPrice - buffer).toFixed(2);
+        order.price = parseFloat((stopPrice - buffer).toFixed(2));  // number
     }
+
+    log('STOP', `Submitting ${orderType} ${quantity} ${ticker}`, {
+        stopPrice: order.stopPrice,
+        limitPrice: order.price || null,
+        session,
+        orderBody: JSON.stringify(order)
+    });
 
     try {
         const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
@@ -271,9 +278,13 @@ async function placeStopOrder(ticker, quantity, stopPrice) {
         });
         return { success: true, orderId, latency: lat };
     } catch (e) {
+        const errData = e.response?.data;
         log('ERROR', `STOP failed: ${ticker}`, {
             error: e.response?.data?.message || e.message,
-            stopPrice: stopPrice.toFixed(2)
+            statusCode: e.response?.status,
+            responseBody: errData ? JSON.stringify(errData) : null,
+            stopPrice: stopPrice.toFixed(2),
+            orderSent: JSON.stringify(order)
         });
         return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 };
     }
@@ -360,6 +371,9 @@ async function checkHeartbeats(pt) {
         const age = Math.round((Date.now() - pos.lastSignalTime) / 1000);
         log('WARN', `💔 HEARTBEAT EXPIRED: ${pos.ticker}`, { tradeId: pos.tradeId, ageSecs: age, timeout });
 
+        // Mark as closing so heartbeat ratcheting skips this position
+        pos.isClosing = true;
+
         let sellPrice = pos.entryPrice;
         const currentPrice = await getCurrentPrice(pos.ticker);
         if (currentPrice > 0) {
@@ -369,7 +383,14 @@ async function checkHeartbeats(pt) {
             log('WARN', `💔 ${pos.ticker}: using entry price as fallback`);
         }
 
+        // Cancel stop by ID first, then all orders, then wait
+        if (pos.stopOrderId) {
+            await cancelOrder(pos.stopOrderId);
+            log('STOP', `Cancelled stop ${pos.stopOrderId} before heartbeat close`, { ticker: pos.ticker });
+        }
         await cancelOrdersForTicker(pos.ticker);
+        await new Promise(r => setTimeout(r, 500));
+
         const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HEARTBEAT_EXPIRED', sellPrice);
 
         if (result.success) {
