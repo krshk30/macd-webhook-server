@@ -595,7 +595,43 @@ async function checkFloors(pt) {
         const profitPct = (currentPrice - pos.entryPrice) / pos.entryPrice * 100;
         const floorPct = calculateFloor(profitPct);
 
-        // No floor active yet
+        // HARD STOP: if price dropped below entry - STOP_LOSS_CENTS, sell immediately
+        // This catches the case where the TRIGGER's child STOP was rejected
+        const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
+        const hardStopPrice = pos.entryPrice - stopCents;
+        if (currentPrice <= hardStopPrice) {
+            log('FLOOR', `🛑 HARD STOP: ${pos.ticker} price $${currentPrice.toFixed(2)} <= stop $${hardStopPrice.toFixed(2)}`, {
+                tradeId: pos.tradeId, entryPrice: pos.entryPrice, profitPct: profitPct.toFixed(2)
+            });
+            pos.isClosing = true;
+            await cancelOrdersForTicker(pos.ticker);
+            await new Promise(r => setTimeout(r, 300));
+            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HARD_STOP', currentPrice);
+            if (result.success) {
+                journalTrade({
+                    action: 'HARD_STOP',
+                    tradeId: pos.tradeId,
+                    ticker: pos.ticker,
+                    entryPrice: pos.entryPrice,
+                    sellPrice: currentPrice,
+                    hardStopPrice,
+                    profitPct: profitPct.toFixed(2)
+                });
+                const summary = pt.closePosition(pos.ticker, currentPrice, 'HARD_STOP');
+                if (summary) {
+                    await notify(
+                        `🛑 HARD STOP: ${pos.ticker}\n` +
+                        `TradeID: ${summary.tradeId}\n` +
+                        `Entry $${summary.entryPrice.toFixed(2)} → Stop $${hardStopPrice.toFixed(2)} → Sold $${currentPrice.toFixed(2)}\n` +
+                        `P&L: $${summary.pnl.toFixed(2)}`,
+                        'loss'
+                    );
+                }
+            }
+            continue;
+        }
+
+        // No floor active yet (profit below 1%) — skip floor logic but hard stop above already covers
         if (floorPct <= -999) continue;
 
         const floorPrice = pos.entryPrice * (1 + floorPct / 100);
