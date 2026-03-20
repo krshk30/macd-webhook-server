@@ -17,8 +17,25 @@ const DEFAULT_QTY = () => parseInt(process.env.DEFAULT_QUANTITY || '10');
 router.post('/webhook', async (req, res) => {
     const t0 = Date.now(), body = req.body;
 
+    // Guard: empty or non-JSON body
+    if (!body || typeof body !== 'object') {
+        log('WARN', 'Webhook received with empty/invalid body', {
+            ip: req.ip, contentType: req.headers['content-type'],
+            rawBodyType: typeof body
+        });
+        return res.status(400).json({ error: 'invalid body' });
+    }
+
     if (body.token !== process.env.WEBHOOK_TOKEN) {
-        log('WARN', `Unauthorized webhook attempt`, { ip: req.ip });
+        log('WARN', `Unauthorized webhook attempt`, {
+            ip: req.ip,
+            action: body.action,
+            ticker: body.ticker,
+            receivedToken: body.token ? body.token.substring(0, 5) + '***' : 'MISSING',
+            expectedToken: process.env.WEBHOOK_TOKEN ? process.env.WEBHOOK_TOKEN.substring(0, 5) + '***' : 'NOT_SET',
+            bodyKeys: Object.keys(body || {}).join(','),
+            contentType: req.headers['content-type']
+        });
         return res.status(401).json({ error: 'unauthorized' });
     }
     if (!schwabService.isAuthenticated()) {
