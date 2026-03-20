@@ -204,6 +204,64 @@ async function placeSellOrder(ticker, quantity, reason, price) {
     }
 }
 
+// v1.3.0: Place a STOP LOSS order (safety net on TOS)
+async function placeStopOrder(ticker, quantity, stopPrice) {
+    const t0 = Date.now(), session = getSessionType();
+    const buffer = getLimitBuffer();
+
+    // Regular hours: STOP order (becomes market when triggered)
+    // Extended hours: STOP_LIMIT (must have limit price for SEAMLESS session)
+    const useStopLimit = !isRegularHours();
+    const orderType = useStopLimit ? 'STOP_LIMIT' : 'STOP';
+
+    const order = {
+        orderType,
+        session,
+        duration: 'DAY',
+        orderStrategyType: 'SINGLE',
+        stopPrice: stopPrice.toFixed(2),
+        orderLegCollection: [{
+            instruction: 'SELL',
+            quantity,
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
+        }]
+    };
+
+    // STOP_LIMIT needs a limit price below the stop
+    if (useStopLimit) {
+        order.price = (stopPrice - buffer).toFixed(2);
+    }
+
+    try {
+        const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
+        const lat = Date.now() - t0;
+        const orderId = r.headers.location?.split('/').pop();
+        log('STOP', `Placed ${orderType} ${quantity} ${ticker} @ $${stopPrice.toFixed(2)}`, {
+            orderId, session, latency: lat
+        });
+        return { success: true, orderId, latency: lat };
+    } catch (e) {
+        log('ERROR', `STOP failed: ${ticker}`, {
+            error: e.response?.data?.message || e.message,
+            stopPrice: stopPrice.toFixed(2)
+        });
+        return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 };
+    }
+}
+
+// v1.3.0: Cancel a specific order by ID (for stop ratcheting)
+async function cancelOrder(orderId) {
+    if (!orderId) return false;
+    try {
+        await api.delete(`/accounts/${getAccountId()}/orders/${orderId}`);
+        log('ORDER', `Cancelled order ${orderId}`);
+        return true;
+    } catch (e) {
+        log('WARN', `Cancel order ${orderId} failed`, { status: e.response?.status });
+        return false;
+    }
+}
+
 async function cancelOrdersForTicker(ticker) {
     try {
         const now = new Date(), todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
@@ -330,6 +388,7 @@ module.exports = {
     schwabService: {
         getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh,
         isAuthenticated, getTokenStatus, placeBuyOrder, placeSellOrder,
+        placeStopOrder, cancelOrder,
         getPositionsFromSchwab, getCurrentPrice, cancelOrdersForTicker,
         getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId,
         isRegularHours, getSessionType,

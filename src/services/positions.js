@@ -158,7 +158,10 @@ function openPosition(ticker, entryPrice, quantity, webhookData = {}) {
             ema9: webhookData.ema9 || null,
             ema20: webhookData.ema20 || null,
             volume: webhookData.volume || null
-        }
+        },
+        // v1.3.0: Stop loss tracking
+        stopOrderId: null,
+        currentStopPrice: 0
     };
 
     positions.set(ticker, pos);
@@ -185,6 +188,42 @@ function getPosition(ticker) { return positions.get(ticker) || null; }
 function touchPosition(ticker) {
     const p = positions.get(ticker);
     if (p) { p.lastSignalTime = Date.now(); }
+}
+
+// v1.3.0: Stop loss tracking
+function setStopOrder(ticker, orderId, stopPrice) {
+    const p = positions.get(ticker);
+    if (p) {
+        p.stopOrderId = orderId;
+        p.currentStopPrice = stopPrice;
+        saveToDisk();
+        log('STOP', `Set stop for ${ticker}: $${stopPrice.toFixed(2)}`, {
+            tradeId: p.tradeId, orderId
+        });
+    }
+}
+
+function getStopPrice(ticker) {
+    const p = positions.get(ticker);
+    return p ? p.currentStopPrice : 0;
+}
+
+function getStopOrderId(ticker) {
+    const p = positions.get(ticker);
+    return p ? p.stopOrderId : null;
+}
+
+function updateStopPrice(ticker, newStopPrice, newOrderId) {
+    const p = positions.get(ticker);
+    if (p) {
+        const oldPrice = p.currentStopPrice;
+        p.currentStopPrice = newStopPrice;
+        if (newOrderId) p.stopOrderId = newOrderId;
+        saveToDisk();
+        log('STOP', `Ratcheted stop for ${ticker}: $${oldPrice.toFixed(2)} → $${newStopPrice.toFixed(2)}`, {
+            tradeId: p.tradeId
+        });
+    }
 }
 
 // --- Heartbeat Expired ---
@@ -365,7 +404,8 @@ function getStatus() {
 module.exports = {
     positions: {
         isDuplicate, canOpenPosition, openPosition, getPosition,
-        touchPosition, getHeartbeatExpired, scalePosition, closePosition,
+        touchPosition, setStopOrder, getStopPrice, getStopOrderId, updateStopPrice,
+        getHeartbeatExpired, scalePosition, closePosition,
         markMilestone, getStatus, markOrphan, getOrphans
     }
 };

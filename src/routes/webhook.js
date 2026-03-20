@@ -34,11 +34,50 @@ router.post('/webhook', async (req, res) => {
         const pos = positions.getPosition(ticker);
         if (pos) {
             positions.touchPosition(ticker);
+
+            // v1.3.0: Ratchet stop loss based on floor from Pine
+            const floorPrice = parseFloat(body.floorPrice) || 0;
+            const currentStop = positions.getStopPrice(ticker);
+            let stopUpdated = false;
+
+            // Fallback: if no stop exists yet (initial failed), place one now
+            if (currentStop === 0) {
+                const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
+                const fallbackStop = floorPrice > 0 ? floorPrice : pos.entryPrice - stopCents;
+                if (fallbackStop > 0) {
+                    const stopResult = await schwabService.placeStopOrder(
+                        ticker, pos.remainingQuantity, fallbackStop
+                    );
+                    if (stopResult.success) {
+                        positions.updateStopPrice(ticker, fallbackStop, stopResult.orderId);
+                        stopUpdated = true;
+                        log('STOP', `Fallback stop placed for ${ticker} @ $${fallbackStop.toFixed(2)}`);
+                    }
+                }
+            } else if (floorPrice > 0 && floorPrice > currentStop) {
+                // Floor has increased — cancel old stop, place new one
+                const oldStopId = positions.getStopOrderId(ticker);
+                if (oldStopId) {
+                    await schwabService.cancelOrder(oldStopId);
+                }
+                const stopResult = await schwabService.placeStopOrder(
+                    ticker, pos.remainingQuantity, floorPrice
+                );
+                if (stopResult.success) {
+                    positions.updateStopPrice(ticker, floorPrice, stopResult.orderId);
+                    stopUpdated = true;
+                }
+            }
+
             return res.json({
                 status: 'heartbeat_ok',
                 ticker,
                 tradeId: pos.tradeId,
                 remaining: pos.remainingQuantity,
+                currentStop: positions.getStopPrice(ticker),
+                stopUpdated,
+                tier: body.tier,
+                profitPct: body.profitPct,
                 serverLatency: Date.now() - t0
             });
         }
@@ -88,6 +127,22 @@ async function handleBuy(ticker, price, body) {
     if (result.success) {
         // v1.3.0: pass full body so position stores entry indicators
         positions.openPosition(ticker, entryPrice, qty, body);
+
+        // v1.3.0: Place initial stop loss (2¢ below entry)
+        // Wait 2s for BUY to fill on Schwab before placing stop
+        await new Promise(r => setTimeout(r, 2000));
+        const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
+        const stopPrice = entryPrice - stopCents;
+        if (stopPrice > 0) {
+            const stopResult = await schwabService.placeStopOrder(ticker, qty, stopPrice);
+            if (stopResult.success) {
+                positions.setStopOrder(ticker, stopResult.orderId, stopPrice);
+            } else {
+                log('WARN', `Stop order failed for ${ticker} — will retry on heartbeat`, {
+                    stopPrice: stopPrice.toFixed(2), error: stopResult.error
+                });
+            }
+        }
     }
 
     const tradeId = getTradeId(ticker);
@@ -98,6 +153,7 @@ async function handleBuy(ticker, price, body) {
         ticker,
         quantity: qty,
         entryPrice,
+        stopPrice: entryPrice - parseFloat(process.env.STOP_LOSS_CENTS || '0.02'),
         orderId: result.orderId,
         schwabLatency: result.latency,
         session: schwabService.getSessionType(),
@@ -117,6 +173,12 @@ async function handleScale(ticker, price, body) {
     const sellPct = parseInt(body.sell_pct) || 50;
     const currentPrice = parseFloat(price) || 0;
 
+    // v1.3.0: Cancel existing stop BEFORE selling (prevents overselling)
+    const oldStopId = positions.getStopOrderId(ticker);
+    if (oldStopId) {
+        await schwabService.cancelOrder(oldStopId);
+    }
+
     positions.markMilestone(ticker, level);
     const scaleResult = positions.scalePosition(ticker, sellPct, level, currentPrice);
 
@@ -124,6 +186,12 @@ async function handleScale(ticker, price, body) {
         log('WARN', `SCALE ${ticker}: nothing to sell`, {
             tradeId: pos.tradeId, level, sellPct, remaining: pos.remainingQuantity
         });
+        // Re-place stop if we cancelled it but didn't sell
+        const currentStop = positions.getStopPrice(ticker);
+        if (currentStop > 0 && pos.remainingQuantity > 0) {
+            const stopResult = await schwabService.placeStopOrder(ticker, pos.remainingQuantity, currentStop);
+            if (stopResult.success) positions.updateStopPrice(ticker, currentStop, stopResult.orderId);
+        }
         return { success: false, rejected: 'nothing to sell' };
     }
 
@@ -132,14 +200,29 @@ async function handleScale(ticker, price, body) {
         `Scale ${level} (${sellPct}%)`, currentPrice
     );
 
+    // v1.3.0: Place new stop for REMAINING shares at current floor
+    const updatedPos = positions.getPosition(ticker);
+    if (updatedPos && updatedPos.remainingQuantity > 0) {
+        const currentStop = positions.getStopPrice(ticker);
+        if (currentStop > 0) {
+            const stopResult = await schwabService.placeStopOrder(
+                ticker, updatedPos.remainingQuantity, currentStop
+            );
+            if (stopResult.success) {
+                positions.updateStopPrice(ticker, currentStop, stopResult.orderId);
+            }
+        }
+    }
+
     return {
         success: result.success,
         action: 'SCALE',
         tradeId: pos.tradeId,
         ticker, level,
         sharesSold: scaleResult.sharesToSell,
-        remaining: pos.remainingQuantity,
+        remaining: updatedPos ? updatedPos.remainingQuantity : 0,
         scalePnL: scaleResult.pnl.toFixed(2),
+        currentStop: positions.getStopPrice(ticker),
         schwabLatency: result.latency
     };
 }
