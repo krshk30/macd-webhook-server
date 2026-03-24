@@ -564,18 +564,13 @@ function startHeartbeatCheck(pt) {
 // Replicates Pine's floor logic server-side so we don't wait for heartbeat
 let floorMonitorTimer = null;
 
-function calculateFloor(profitPct) {
-    // Mirror Pine's floor milestones exactly
-    const FLOOR_AT_1 = parseFloat(process.env.FLOOR_AT_1PCT || '0');
-    const FLOOR_AT_2 = parseFloat(process.env.FLOOR_AT_2PCT || '0.5');
-    const FLOOR_AT_3 = parseFloat(process.env.FLOOR_AT_3PCT || '1.5');
-    const FLOOR_AT_4 = parseFloat(process.env.FLOOR_AT_4PCT || '2.5');
-    const TRAIL_GAP  = parseFloat(process.env.FLOOR_TRAIL_GAP || '1.5');
-
-    if (profitPct >= 4) return Math.max(FLOOR_AT_4, profitPct - TRAIL_GAP);
-    if (profitPct >= 3) return FLOOR_AT_3;
-    if (profitPct >= 2) return FLOOR_AT_2;
-    if (profitPct >= 1) return FLOOR_AT_1;
+function calculateFloor(peakProfitPct) {
+    // Simple rule: always 1% behind peak
+    // Below 1% peak: no floor (hard stop only)
+    // 1% peak: floor at 0.5% (protect half)
+    // 2%+ peak: floor = peak - 1% (always 1% behind)
+    if (peakProfitPct >= 2) return peakProfitPct - 1.0;
+    if (peakProfitPct >= 1) return 0.5;
     return -999; // no floor yet
 }
 
@@ -593,7 +588,12 @@ async function checkFloors(pt) {
         if (currentPrice <= 0) continue;
 
         const profitPct = (currentPrice - pos.entryPrice) / pos.entryPrice * 100;
-        const floorPct = calculateFloor(profitPct);
+
+        // Track peak profit on server side (mirrors Pine's maxProfitPct)
+        if (!pos.serverPeakPct) pos.serverPeakPct = 0;
+        if (profitPct > pos.serverPeakPct) pos.serverPeakPct = profitPct;
+
+        const floorPct = calculateFloor(pos.serverPeakPct);
 
         // HARD STOP: if price dropped below entry - STOP_LOSS_CENTS, sell immediately
         // This catches the case where the TRIGGER's child STOP was rejected
