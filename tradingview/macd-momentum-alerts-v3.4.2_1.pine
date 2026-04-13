@@ -1,0 +1,803 @@
+// =====================================================================
+// MACD MOMENTUM ALERTS v3.4.2 -- VWAP Distance Filter
+// =====================================================================
+// v3.4.2 CHANGES:
+//   - VWAP MAX DISTANCE: blocks entry when price > X% above session VWAP
+//     Configurable via "VWAP Max % Above" setting (default 10%, set 0 = OFF)
+//     Only applies INSIDE the session (0930-1600). Pre/post market entries
+//     are NOT blocked — no stale previous-day VWAP comparisons.
+//
+// v3.4 CHANGES:
+//   - STOCHK ENTRY CAP: blocks entry when StochK >= 90 (overbought)
+//   - EMA9 MAX DISTANCE: blocks entry when price > 8% above EMA9
+//   - P1 MIN BARS BELOW: MACD must be below signal for 3+ bars before cross
+//   - P3 STRICTER SCORE: P3 surge requires 5/6 quality (vs 4/6 for P1/P2)
+//   - P3 HISTOGRAM FLOOR: minimum histogram 0.01 for P3
+//   - P3 ABOVE EMA9: P3 requires price > EMA9
+//   - EXITS FIRE INTRABAR: no barstate.isconfirmed on exits/scales
+//   - LABELS SHOW PROFIT: exit labels show current% (pk:peak%)
+//   - TIER USES PEAK: profitTier based on maxProfitPct, not current
+//
+// v3.3: Tiered exits, profit floor, EMA20 hard gate
+// v3.2: Triple-layer alert dedup
+// v3.1: Three entry paths with confirmation + quality scoring
+// =====================================================================
+
+//@version=5
+indicator("MACD Confirmed Entry v3.4.2",
+     overlay          = true,
+     max_labels_count = 500)
+
+
+// --- INPUTS ----------------------------------------------------------
+
+grpMACD  = "MACD"
+fastLen  = input.int(12,  "Fast Length",      minval = 1, group = grpMACD)
+slowLen  = input.int(26,  "Slow Length",      minval = 1, group = grpMACD)
+sigLen   = input.int(9,   "Signal Length",    minval = 1, group = grpMACD)
+
+grpWebhook = "Webhook"
+webhookToken = input.string("your-token-here", "Webhook Token", group = grpWebhook,
+     tooltip = "Must match WEBHOOK_TOKEN in your Railway server.")
+
+grpConfirm = "Confirmed Entry"
+confirmBars   = input.int(2, "Confirmation Bars", minval = 1, maxval = 5, group = grpConfirm,
+     tooltip = "How many bars to wait after trigger before entering.")
+minScore      = input.int(4, "Min Quality Score", minval = 1, maxval = 6, group = grpConfirm,
+     tooltip = "Minimum quality score (out of 6) required to enter.")
+useConfirm    = input.bool(true, "Enable Confirmation", group = grpConfirm,
+     tooltip = "Uncheck for instant entry on all paths (no confirmation).")
+requireBarClose = input.bool(true, "Require Bar Close to Confirm", group = grpConfirm,
+     tooltip = "When checked, BUY only fires after the confirmation bar closes. Prevents repainting. Recommended.")
+
+grpPaths = "Entry Paths"
+enablePath1 = input.bool(true,  "Path 1: MACD Cross Above",     group = grpPaths)
+p1MinBarsBelow = input.int(3,  "P1: Min Bars MACD Below Signal", minval = 1, maxval = 10, group = grpPaths,
+     tooltip = "MACD must have been below signal for at least this many bars before the cross counts. Blocks choppy false crosses.")
+enablePath2 = input.bool(true,  "Path 2: VWAP Breakout",        group = grpPaths)
+enablePath3 = input.bool(true,  "Path 3: MACD Momentum Surge",  group = grpPaths)
+surgeRate   = input.float(0.001, "Path 3: Min MACD Increase",   step = 0.0005, group = grpPaths,
+     tooltip = "MACD must increase by at least this amount in one bar to trigger momentum surge.")
+p3HistFloor = input.float(0.01, "P3: Min Histogram",           step = 0.005, group = grpPaths,
+     tooltip = "Histogram must be at least this value for P3 to fire. Blocks weak surges near zero.")
+p3RequireAboveEMA9 = input.bool(true, "P3: Require Price > EMA9", group = grpPaths,
+     tooltip = "P3 is momentum — price should be above EMA9 to confirm short-term strength.")
+p3MinScore  = input.int(5,     "P3: Min Quality Score",         minval = 1, maxval = 6, group = grpPaths,
+     tooltip = "P3 surge requires stricter quality score than P1/P2. Default 5 out of 6.")
+p3PrevBarGreen = input.bool(false, "P3: Previous Bar Green", group = grpPaths,
+     tooltip = "P3 requires the previous bar was green (close > open). Blocks surges after failed momentum.")
+
+grpEMA   = "EMAs"
+ema1Len  = input.int(9,    "EMA 1 Length",     minval = 1, group = grpEMA)
+ema2Len  = input.int(20,   "EMA 2 Length",     minval = 1, group = grpEMA)
+
+grpStoch = "Stochastic"
+stochLen = input.int(5,   "K Length",         minval = 1, group = grpStoch)
+stochSmK = input.int(1,   "K Smoothing",      minval = 1, group = grpStoch)
+stochExitLvl = input.int(20, "Exit below K",  minval = 1, group = grpStoch)
+
+grpVWAP  = "VWAP"
+vwapSession = input.session("0930-1600", "Session Anchor", group = grpVWAP)
+
+grpScale = "Scaled Exits"
+scale2pctThresh   = input.float(2.0,  "2% Threshold",   step = 0.5, group = grpScale)
+scale2pctSell     = input.int(50,     "2% Sell %",       minval = 1, maxval = 100, group = grpScale)
+scaleFast4Thresh  = input.float(4.0,  "Fast 4% Threshold", step = 0.5, group = grpScale)
+scaleFast4Sell    = input.int(75,     "Fast 4% Sell %",  minval = 1, maxval = 100, group = grpScale)
+scale4after2Thresh = input.float(4.0, "4% After 2% Threshold", step = 0.5, group = grpScale)
+scale4after2Sell  = input.int(25,     "4% After 2% Sell %", minval = 1, maxval = 100, group = grpScale)
+
+grpFloor = "Profit Floor (v3.3)"
+useFloorSystem = input.bool(true, "Enable Profit Floor", group = grpFloor,
+     tooltip = "Once profit reaches a milestone, a floor locks in. Price dropping to the floor triggers instant CLOSE.")
+tier2Thresh    = input.float(1.0, "Tier 2 Threshold %",  step = 0.5, group = grpFloor,
+     tooltip = "Above this profit: StochK exit requires ALSO below EMA9.")
+tier3Thresh    = input.float(3.0, "Tier 3 Threshold %",  step = 0.5, group = grpFloor,
+     tooltip = "Above this profit: only MACD cross below exits (StochK ignored). Floor still active.")
+floor1pct      = input.float(0.0, "Floor at 1% profit",  step = 0.25, group = grpFloor,
+     tooltip = "When profit first reaches 1%, floor locks at this %. 0 = breakeven.")
+floor2pct      = input.float(0.5, "Floor at 2% profit",  step = 0.25, group = grpFloor)
+floor3pct      = input.float(1.5, "Floor at 3% profit",  step = 0.25, group = grpFloor)
+floor4pct      = input.float(2.5, "Floor at 4% profit",  step = 0.25, group = grpFloor)
+floorTrailGap  = input.float(1.5, "Trail Gap above 4%",  step = 0.25, group = grpFloor,
+     tooltip = "Above 4% profit, floor = peak profit minus this gap. E.g. peak 6%, gap 1.5% → floor 4.5%.")
+
+grpFilt  = "Filters"
+volMin      = input.int(10000, "Volume Threshold",    group = grpFilt)
+cooldownLen = input.int(5,     "Cooldown Bars",        group = grpFilt)
+useRegHours = input.bool(true, "Trading Hours Filter", group = grpFilt)
+regStartH   = input.int(7,     "  Start Hour",        group = grpFilt)
+regStartM   = input.int(0,     "  Start Min",         group = grpFilt)
+regEndH     = input.int(16,    "  End Hour",          group = grpFilt)
+regEndM     = input.int(0,     "  End Min",           group = grpFilt)
+useDeadZone = input.bool(true, "Enable Dead Zone",     group = grpFilt)
+deadStartH  = input.int(12,    "  DZ Start Hour",     group = grpFilt)
+deadStartM  = input.int(1,     "  DZ Start Min",      group = grpFilt)
+deadEndH    = input.int(15,    "  DZ End Hour",        group = grpFilt)
+deadEndM    = input.int(0,     "  DZ End Min",         group = grpFilt)
+requireAboveEMA = input.bool(true, "Require Price > EMA 20", group = grpFilt,
+     tooltip = "Hard gate: blocks ALL entry paths when price is below EMA 20. Eliminates downtrend entries.")
+useStochKCap = input.bool(true, "StochK Entry Cap", group = grpFilt,
+     tooltip = "Block entry when StochK is overbought. Prevents buying parabolic tops.")
+stochKCapLevel = input.int(90, "  StochK Max Level", minval = 50, maxval = 100, group = grpFilt,
+     tooltip = "Block entry when StochK >= this value. Default 90 = block overbought entries.")
+useEMA9MaxDist = input.bool(true, "EMA9 Max Distance", group = grpFilt,
+     tooltip = "Block entry when price is too far above EMA9. Prevents chasing extended moves.")
+ema9MaxDistPct = input.float(8.0, "  Max % Above EMA9", step = 1.0, group = grpFilt,
+     tooltip = "Block entry when price is more than this % above EMA9. Default 8%.")
+vwapMaxDistPct = input.float(10.0, "VWAP Max % Above (0 = OFF)", step = 1.0, group = grpFilt,
+     tooltip = "Block entry when price is more than this % above session VWAP. Only applies during 0930-1600 session. Pre/post market entries are never blocked by this. Set 0 to disable.")
+
+grpVis   = "Visuals"
+showVwap    = input.bool(true,  "Show VWAP",            group = grpVis)
+showEMAs    = input.bool(true,  "Show EMAs",            group = grpVis)
+showSignals = input.bool(true,  "Show Signal Markers",  group = grpVis)
+showConfirmMarkers = input.bool(true, "Show Confirm ?/X Markers", group = grpVis)
+showDash    = input.bool(true,  "Show Dashboard",       group = grpVis)
+
+
+// --- INDICATORS ------------------------------------------------------
+
+[macdValue, signalValue, histValue] = ta.macd(close, fastLen, slowLen, sigLen)
+
+macdAboveSignal = macdValue > signalValue
+macdCrossAbove  = macdAboveSignal and not macdAboveSignal[1]
+macdCrossBelow  = not macdAboveSignal and macdAboveSignal[1]
+macdIncreasing  = macdValue > macdValue[1]
+macdDelta       = macdValue - macdValue[1]
+histGrowing     = histValue > histValue[1]
+
+// v3.3: Track consecutive bars MACD was below signal (for P1 filter)
+var int barsBelowSignal = 0
+if not macdAboveSignal
+    barsBelowSignal := barsBelowSignal + 1
+else
+    barsBelowSignal := 0
+// On cross bar, check how many bars it WAS below (use [1] since current bar is now above)
+macdWasBelowEnough = macdCrossAbove and barsBelowSignal[1] >= p1MinBarsBelow
+
+rawK   = ta.stoch(close, high, low, stochLen)
+stochK = stochSmK <= 1 ? rawK : ta.sma(rawK, stochSmK)
+
+stochRising = stochK > stochK[1]
+ema1 = ta.ema(close, ema1Len)
+ema2 = ta.ema(close, ema2Len)
+
+
+// --- SESSION VWAP ----------------------------------------------------
+var float cumPV   = 0.0
+var float cumVol  = 0.0
+var float sessVwap = na
+
+inSession    = not na(time(timeframe.period, vwapSession))
+sessionStart = inSession and not inSession[1]
+
+if sessionStart
+    cumPV  := 0.0
+    cumVol := 0.0
+
+if inSession
+    typicalPrice = (high + low + close) / 3
+    cumPV  := cumPV  + typicalPrice * volume
+    cumVol := cumVol + volume
+    sessVwap := cumVol > 0 ? cumPV / cumVol : close
+
+aboveVWAP      = close > sessVwap
+vwapCrossAbove = aboveVWAP and not aboveVWAP[1]
+
+
+// --- FILTERS ---------------------------------------------------------
+
+currentMins = hour * 60 + minute
+regStart    = regStartH * 60 + regStartM
+regEnd      = regEndH   * 60 + regEndM
+inRegHours  = currentMins >= regStart and currentMins < regEnd
+regHoursOk  = useRegHours ? inRegHours : true
+
+deadStart   = deadStartH * 60 + deadStartM
+deadEnd     = deadEndH   * 60 + deadEndM
+inDeadZone  = useDeadZone and currentMins >= deadStart and currentMins < deadEnd
+              and deadStart > 0 and deadEnd > 0
+timeAllowed = regHoursOk and not inDeadZone
+
+volOk = volume > volMin
+
+// v3.3: EMA20 hard gate — blocks all entries when price below EMA20
+emaGateOk = requireAboveEMA ? close > ema2 : true
+
+// v3.4: StochK entry cap — blocks overbought entries
+stochKGateOk = useStochKCap ? stochK < stochKCapLevel : true
+
+// v3.4: EMA9 max distance — blocks overextended entries
+ema9DistPct = ema1 > 0 ? ((close - ema1) / ema1 * 100) : 0
+ema9DistGateOk = useEMA9MaxDist ? ema9DistPct < ema9MaxDistPct : true
+
+// v3.4.2: VWAP max distance — only applied INSIDE session (0930-1600)
+// Outside session: sessVwap is stale from previous day — skip filter entirely
+vwapDistPct    = inSession and sessVwap > 0 ? ((close - sessVwap) / sessVwap * 100) : 0
+vwapDistGateOk = (vwapMaxDistPct > 0 and inSession and sessVwap > 0) ? vwapDistPct < vwapMaxDistPct : true
+
+// v3.4: Combined entry gate
+allGatesOk = emaGateOk and stochKGateOk and ema9DistGateOk and vwapDistGateOk
+
+
+// --- COOLDOWN --------------------------------------------------------
+
+stochCrossBelow = stochK < stochExitLvl and stochK[1] >= stochExitLvl
+exitCondition = macdCrossBelow or stochCrossBelow
+
+var int cooldown = 0
+if exitCondition
+    cooldown := cooldownLen
+else if cooldown > 0
+    cooldown := cooldown - 1
+
+cooldownActive = cooldown > 0
+
+
+// --- POSITION TRACKING -----------------------------------------------
+var bool  inPosition   = false
+var float entryPrice   = 0.0
+var bool  hit2pct      = false
+var bool  hitFast4pct  = false
+var bool  hit4after2   = false
+var int   soldPct      = 0
+
+// --- ALERT DEDUP: boolean flags (Layer 1) ----------------------------
+var bool  buyAlertFired   = false
+var bool  exitAlertFired  = false
+
+// --- ALERT DEDUP: bar_index trackers (Layer 3) -----------------------
+var int lastBuyBar       = -1
+var int lastCloseBar     = -1
+var int lastScaleFast4Bar = -1
+var int lastScale2Bar    = -1
+var int lastScale4a2Bar  = -1
+var int lastHeartbeatBar = -1
+
+// --- PROFIT FLOOR TRACKING (v3.3) ------------------------------------
+var float maxProfitPct  = 0.0
+var float profitFloor   = -999.0
+var bool  floorActive   = false
+
+
+// --- RAW TRIGGER DETECTION -------------------------------------------
+
+rawTriggerP1 = enablePath1
+     and macdWasBelowEnough
+     and allGatesOk
+     and not inPosition
+     and not buyAlertFired
+
+rawTriggerP2 = enablePath2
+     and vwapCrossAbove
+     and macdAboveSignal
+     and macdIncreasing
+     and allGatesOk
+     and not inPosition
+     and not buyAlertFired
+
+rawTriggerP3 = enablePath3
+     and macdAboveSignal
+     and not macdCrossAbove
+     and macdDelta >= surgeRate
+     and macdDelta > macdDelta[1]
+     and histValue >= p3HistFloor
+     and (not p3RequireAboveEMA9 or close > ema1)
+     and (not p3PrevBarGreen or close[1] > open[1])
+     and allGatesOk
+     and not inPosition
+     and not buyAlertFired
+
+rawTrigger = rawTriggerP1 or rawTriggerP2 or rawTriggerP3
+
+
+// --- CONFIRMATION STATE MACHINE --------------------------------------
+
+var int    confirmState     = 0
+var int    triggerBarIdx    = -1
+var float  crossPrice       = 0.0
+var int    qualityScore     = 0
+var bool   confirmCancelled = false
+var string triggerPath      = ""
+
+confirmCount = confirmState == 1 ? bar_index - triggerBarIdx : 0
+
+if rawTrigger and confirmState == 0
+    confirmState     := 1
+    triggerBarIdx    := bar_index
+    crossPrice       := close
+    qualityScore     := 0
+    confirmCancelled := false
+    triggerPath      := rawTriggerP1 ? "P1_CROSS" : rawTriggerP2 ? "P2_VWAP" : "P3_SURGE"
+
+if confirmState == 1
+    if not macdAboveSignal
+        confirmState     := 0
+        confirmCancelled := true
+
+    if close < crossPrice
+        confirmState     := 0
+        confirmCancelled := true
+
+    if confirmCount >= confirmBars and confirmState == 1
+        qualityScore := 0
+        if histGrowing
+            qualityScore := qualityScore + 1
+        if stochRising
+            qualityScore := qualityScore + 1
+        if aboveVWAP
+            qualityScore := qualityScore + 1
+        if volOk
+            qualityScore := qualityScore + 1
+        if macdIncreasing
+            qualityScore := qualityScore + 1
+        if close > ema1 and close > ema2
+            qualityScore := qualityScore + 1
+
+        // v3.3: P3 surge uses stricter score threshold
+        requiredScore = triggerPath == "P3_SURGE" ? p3MinScore : minScore
+        if qualityScore >= requiredScore
+            confirmState := 2
+        else
+            confirmState     := 0
+            confirmCancelled := true
+
+
+// --- ENTRY SIGNALS ---------------------------------------------------
+
+barCloseOk = requireBarClose ? barstate.isconfirmed : true
+
+confirmedEntry = confirmState == 2
+     and barCloseOk
+     and not cooldownActive
+     and timeAllowed
+     and not inPosition
+     and not buyAlertFired
+     and bar_index != lastBuyBar
+
+instantP1 = not useConfirm and rawTriggerP1
+     and macdIncreasing and volOk
+     and not cooldownActive and timeAllowed
+     and not inPosition and not buyAlertFired
+     and bar_index != lastBuyBar
+     and barCloseOk
+
+instantP2 = not useConfirm and rawTriggerP2
+     and volOk
+     and not cooldownActive and timeAllowed
+     and not inPosition and not buyAlertFired
+     and bar_index != lastBuyBar
+     and barCloseOk
+
+instantP3 = not useConfirm and rawTriggerP3
+     and volOk
+     and not cooldownActive and timeAllowed
+     and not inPosition and not buyAlertFired
+     and bar_index != lastBuyBar
+     and barCloseOk
+
+instantEntry = instantP1 or instantP2 or instantP3
+entrySignal  = confirmedEntry or instantEntry
+
+entryPath = confirmedEntry ? triggerPath :
+     instantP1 ? "P1_CROSS" : instantP2 ? "P2_VWAP" : "P3_SURGE"
+
+
+// --- PROFIT TRACKING + FLOOR SYSTEM (v3.3) ---------------------------
+
+profitPct  = inPosition and entryPrice > 0 ? (close - entryPrice) / entryPrice * 100 : 0.0
+
+// Update peak profit and ratchet floor
+if inPosition and entryPrice > 0 and useFloorSystem
+    if profitPct > maxProfitPct
+        maxProfitPct := profitPct
+
+    // Ratchet floor up — never goes down
+    if maxProfitPct >= 4.0
+        // Above 4%: trail at peak minus gap
+        trailFloor = maxProfitPct - floorTrailGap
+        profitFloor := math.max(profitFloor, math.max(trailFloor, floor4pct))
+        floorActive := true
+    else if maxProfitPct >= 3.0
+        profitFloor := math.max(profitFloor, floor3pct)
+        floorActive := true
+    else if maxProfitPct >= 2.0
+        profitFloor := math.max(profitFloor, floor2pct)
+        floorActive := true
+    else if maxProfitPct >= 1.0
+        profitFloor := math.max(profitFloor, floor1pct)
+        floorActive := true
+
+// Calculate floor price in dollars
+floorPrice   = floorActive and entryPrice > 0 ? entryPrice * (1 + profitFloor / 100) : 0.0
+floorBreach  = inPosition and floorActive and close <= floorPrice and useFloorSystem
+
+// Current profit tier
+// v3.3 FIX: Tier based on PEAK profit, not current
+// Once you've been at 2%, you stay in Tier 2 even if price pulls back
+profitTier = maxProfitPct >= tier3Thresh ? 3 : maxProfitPct >= tier2Thresh ? 2 : 1
+
+
+// --- SCALED EXIT MILESTONES ------------------------------------------
+// v3.3: Scales fire INTRABAR (no barstate.isconfirmed) — take profit immediately
+
+scaleFast4   = inPosition
+     and profitPct >= scaleFast4Thresh
+     and not hit2pct and not hitFast4pct
+     and bar_index != lastScaleFast4Bar
+
+scale2pct    = inPosition
+     and profitPct >= scale2pctThresh
+     and not hit2pct and not hitFast4pct
+     and bar_index != lastScale2Bar
+
+scale4after2 = inPosition
+     and profitPct >= scale4after2Thresh
+     and hit2pct and not hit4after2
+     and bar_index != lastScale4a2Bar
+
+
+// --- EXIT SIGNALS (v3.3 Tiered) --------------------------------------
+// v3.3: Exits fire INTRABAR — get out fast, don't wait for bar close
+// Repainting on exits is harmless (already sold)
+
+// MACD cross below: exits ALL tiers
+exitMacdBear = macdCrossBelow
+     and inPosition
+     and not exitAlertFired
+     and bar_index != lastCloseBar
+
+// Tier 1 (profit < tier2Thresh): StochK < exitLvl + falling
+exitStochTier1 = inPosition
+     and (not useFloorSystem or profitTier == 1)
+     and stochK < stochExitLvl
+     and stochK < stochK[1]
+     and not exitAlertFired
+     and bar_index != lastCloseBar
+
+// Tier 2 (profit tier2Thresh to tier3Thresh): StochK < exitLvl + falling + below EMA9
+exitStochTier2 = inPosition
+     and useFloorSystem
+     and profitTier == 2
+     and stochK < stochExitLvl
+     and stochK < stochK[1]
+     and close < ema1
+     and not exitAlertFired
+     and bar_index != lastCloseBar
+
+// Tier 3: NO StochK exit — MACD bear + floor only
+
+// Floor breach: instant CLOSE regardless of tier
+exitFloorBreach = floorBreach
+     and inPosition
+     and not exitAlertFired
+     and bar_index != lastCloseBar
+
+// Combined exit
+exitStochK = exitStochTier1 or exitStochTier2
+exitFinal  = (exitMacdBear or exitStochK or exitFloorBreach) and inPosition
+scaleAlert = scaleFast4 or scale2pct or scale4after2
+
+// --- HEARTBEAT -------------------------------------------------------
+heartbeatSignal = inPosition
+     and barstate.isconfirmed
+     and not entrySignal
+     and not exitFinal
+     and not scaleAlert
+     and bar_index != lastHeartbeatBar
+
+
+// --- STATE UPDATES + ALERT FIRING ------------------------------------
+
+// v3.3: Snapshot values BEFORE resets — used by labels
+exitProfitPct  = profitPct
+exitPeakPct    = maxProfitPct
+exitTier       = profitTier
+
+if entrySignal
+    inPosition      := true
+    entryPrice      := close
+    hit2pct         := false
+    hitFast4pct     := false
+    hit4after2      := false
+    soldPct         := 0
+    buyAlertFired   := true
+    exitAlertFired  := false
+    confirmState    := 0
+    lastBuyBar      := bar_index
+    // v3.3: Reset floor tracking
+    maxProfitPct    := 0.0
+    profitFloor     := -999.0
+    floorActive     := false
+    alert('{"action":"BUY","path":"' + entryPath + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"volume":' + str.tostring(volume) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"stochKprev":' + str.tostring(stochK[1], "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"signal":' + str.tostring(signalValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"ema9":' + str.tostring(ema1, "#.####") + ',"ema20":' + str.tostring(ema2, "#.####") + ',"vwap":' + str.tostring(sessVwap, "#.####") + ',"score":' + str.tostring(qualityScore) + ',"confirmBars":' + str.tostring(confirmCount) + ',"crossPrice":' + str.tostring(crossPrice) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+
+// Scale exits — else-if chain (one per bar)
+if scaleFast4
+    hitFast4pct       := true
+    soldPct           := scaleFast4Sell
+    lastScaleFast4Bar := bar_index
+    alert('{"action":"SCALE","level":"FAST4","sell_pct":' + str.tostring(scaleFast4Sell) + ',"ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+else if scale2pct
+    hit2pct      := true
+    soldPct      := scale2pctSell
+    lastScale2Bar := bar_index
+    alert('{"action":"SCALE","level":"PCT2","sell_pct":' + str.tostring(scale2pctSell) + ',"ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+else if scale4after2
+    hit4after2    := true
+    soldPct       := soldPct + scale4after2Sell
+    lastScale4a2Bar := bar_index
+    alert('{"action":"SCALE","level":"PCT4_AFTER2","sell_pct":' + str.tostring(scale4after2Sell) + ',"ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+
+// v3.3: Exit with reason — separate handlers for proper reason tagging
+if exitFloorBreach and not exitMacdBear
+    inPosition     := false
+    entryPrice     := 0.0
+    buyAlertFired  := false
+    exitAlertFired := true
+    confirmState   := 0
+    lastCloseBar   := bar_index
+    maxProfitPct   := 0.0
+    profitFloor    := -999.0
+    floorActive    := false
+    alert('{"action":"CLOSE","reason":"FLOOR_BREACH","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"floorPct":' + str.tostring(profitFloor, "#.##") + ',"maxProfitPct":' + str.tostring(maxProfitPct, "#.##") + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+
+else if exitMacdBear
+    inPosition     := false
+    entryPrice     := 0.0
+    buyAlertFired  := false
+    exitAlertFired := true
+    confirmState   := 0
+    lastCloseBar   := bar_index
+    maxProfitPct   := 0.0
+    profitFloor    := -999.0
+    floorActive    := false
+    alert('{"action":"CLOSE","reason":"MACD_BEAR","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+
+else if exitStochTier2
+    inPosition     := false
+    entryPrice     := 0.0
+    buyAlertFired  := false
+    exitAlertFired := true
+    confirmState   := 0
+    lastCloseBar   := bar_index
+    maxProfitPct   := 0.0
+    profitFloor    := -999.0
+    floorActive    := false
+    alert('{"action":"CLOSE","reason":"STOCHK_TIER2_' + str.tostring(stochExitLvl) + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"tier":2,"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+
+else if exitStochTier1
+    inPosition     := false
+    entryPrice     := 0.0
+    buyAlertFired  := false
+    exitAlertFired := true
+    confirmState   := 0
+    lastCloseBar   := bar_index
+    maxProfitPct   := 0.0
+    profitFloor    := -999.0
+    floorActive    := false
+    alert('{"action":"CLOSE","reason":"STOCHK_TIER1_' + str.tostring(stochExitLvl) + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"tier":1,"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+
+// v3.3: Heartbeat includes floor data for server stop ratchet
+if heartbeatSignal
+    lastHeartbeatBar := bar_index
+    alert('{"action":"HEARTBEAT","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"floorPct":' + str.tostring(floorActive ? profitFloor : 0, "#.##") + ',"floorPrice":' + str.tostring(floorActive ? floorPrice : 0, "#.####") + ',"maxProfitPct":' + str.tostring(maxProfitPct, "#.##") + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+
+// --- PLOTS -----------------------------------------------------------
+
+plot(macdValue,   "MACD",   display = display.none)
+plot(signalValue, "Signal", display = display.none)
+
+plot(showVwap and not na(sessVwap) and inSession ? sessVwap : na,
+     "Session VWAP", color = color.new(color.yellow, 0), linewidth = 2)
+
+plot(showEMAs ? ema1 : na, "EMA 9",
+     color = color.new(color.aqua, 30), linewidth = 1)
+plot(showEMAs ? ema2 : na, "EMA 20",
+     color = color.new(color.orange, 30), linewidth = 1)
+
+// v3.3: Plot profit floor as a line when in position
+plot(inPosition and floorActive and floorPrice > 0 ? floorPrice : na,
+     "Profit Floor", color = color.new(color.fuchsia, 0),
+     linewidth = 2, style = plot.style_stepline)
+
+plotshape(showSignals and entrySignal and entryPath == "P1_CROSS",
+     "P1: MACD Cross", shape.labelup,
+     location.belowbar, color.new(color.green, 0), size = size.normal,
+     text = "BUY\nCROSS", textcolor = color.white)
+
+plotshape(showSignals and entrySignal and entryPath == "P2_VWAP",
+     "P2: VWAP Break", shape.labelup,
+     location.belowbar, color.new(color.aqua, 0), size = size.normal,
+     text = "BUY\nVWAP", textcolor = color.white)
+
+plotshape(showSignals and entrySignal and entryPath == "P3_SURGE",
+     "P3: MACD Surge", shape.labelup,
+     location.belowbar, color.new(color.lime, 0), size = size.normal,
+     text = "BUY\nSURGE", textcolor = color.black)
+
+plotshape(showConfirmMarkers and rawTrigger and useConfirm and not inPosition and confirmState == 1,
+     "Trigger Detected", shape.diamond,
+     location.belowbar, color.new(color.gray, 0), size = size.tiny,
+     text = "?", textcolor = color.gray)
+
+plotshape(showConfirmMarkers and confirmCancelled, "Confirm Cancelled", shape.xcross,
+     location.belowbar, color.new(color.red, 50), size = size.tiny,
+     text = "X", textcolor = color.red)
+
+// v3.3: Dynamic labels with profit % on exits and scales
+if showSignals and exitMacdBear
+    label.new(bar_index, high, "CLOSE MACD\n" + str.tostring(exitProfitPct, "#.##") + "% (pk:" + str.tostring(exitPeakPct, "#.##") + "%)",
+         style = label.style_label_down, color = color.new(color.red, 0),
+         textcolor = color.white, size = size.normal)
+
+if showSignals and exitStochTier1
+    label.new(bar_index, high, "CLOSE K-T1\n" + str.tostring(exitProfitPct, "#.##") + "% (pk:" + str.tostring(exitPeakPct, "#.##") + "%)",
+         style = label.style_label_down, color = color.new(color.fuchsia, 0),
+         textcolor = color.white, size = size.normal)
+
+if showSignals and exitStochTier2
+    label.new(bar_index, high, "CLOSE K-T2\n" + str.tostring(exitProfitPct, "#.##") + "% (pk:" + str.tostring(exitPeakPct, "#.##") + "%)",
+         style = label.style_label_down, color = color.new(color.purple, 0),
+         textcolor = color.white, size = size.normal)
+
+if showSignals and exitFloorBreach
+    label.new(bar_index, high, "CLOSE FLOOR\n" + str.tostring(exitProfitPct, "#.##") + "% (pk:" + str.tostring(exitPeakPct, "#.##") + "%)",
+         style = label.style_label_down, color = color.new(color.orange, 0),
+         textcolor = color.white, size = size.normal)
+
+if showSignals and scaleFast4
+    label.new(bar_index, high, "SELL FAST\n" + str.tostring(profitPct, "#.##") + "%",
+         style = label.style_label_down, color = color.new(color.yellow, 0),
+         textcolor = color.black, size = size.small)
+
+if showSignals and scale2pct
+    label.new(bar_index, high, "SELL 2%\n" + str.tostring(profitPct, "#.##") + "%",
+         style = label.style_label_down, color = color.new(color.orange, 0),
+         textcolor = color.white, size = size.small)
+
+if showSignals and scale4after2
+    label.new(bar_index, high, "SELL 4%+\n" + str.tostring(profitPct, "#.##") + "%",
+         style = label.style_label_down, color = color.new(color.yellow, 0),
+         textcolor = color.black, size = size.small)
+
+bgcolor(inDeadZone ? color.new(color.gray, 93) : na, title = "Dead Zone")
+bgcolor(useRegHours and not inRegHours ? color.new(color.blue, 95) : na, title = "Outside Hours")
+bgcolor(cooldownActive and not inPosition ? color.new(color.orange, 95) : na, title = "Cooldown")
+bgcolor(inPosition ? color.new(color.green, 95) : na, title = "In Position")
+bgcolor(confirmState == 1 ? color.new(color.yellow, 93) : na, title = "Confirming")
+
+
+// --- DASHBOARD -------------------------------------------------------
+if showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 24,
+         bgcolor = color.new(color.black, 75),
+         border_width = 1,
+         border_color = color.new(color.gray, 60))
+
+    table.cell(dash, 0, 0, "Confirmed v3.4.2", text_color = color.white, text_size = size.small)
+    table.cell(dash, 1, 0, "LIVE",        text_color = color.lime,  text_size = size.small)
+
+    table.cell(dash, 0, 1, "Price",       text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 1, str.tostring(close, "#.##") +
+         (aboveVWAP ? " > VWAP" : " < VWAP"),
+         text_color = aboveVWAP ? color.aqua : color.orange, text_size = size.tiny)
+
+    table.cell(dash, 0, 2, "MACD",        text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 2, str.tostring(macdValue, "#.####") +
+         (macdAboveSignal ? " BULL" : " BEAR"),
+         text_color = macdAboveSignal ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 3, "Histogram",   text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 3, str.tostring(histValue, "#.####") +
+         (histGrowing ? " GROWING" : " SHRINKING"),
+         text_color = histGrowing ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 4, "MACD Delta",  text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 4, str.tostring(macdDelta, "#.######") +
+         (macdDelta >= surgeRate ? " SURGE" : ""),
+         text_color = macdDelta >= surgeRate ? color.lime : color.gray, text_size = size.tiny)
+
+    table.cell(dash, 0, 5, "Stoch K",     text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 5, str.tostring(stochK, "#.0") + " | " + (stochRising ? "RISING" : "FALLING"),
+         text_color = stochRising ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 6, "EMA 9",       text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 6, str.tostring(ema1, "#.####") + (close > ema1 ? " ABOVE" : " BELOW"),
+         text_color = close > ema1 ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 7, "EMA 20",      text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 7, str.tostring(ema2, "#.####") + (close > ema2 ? " ABOVE" : " BELOW"),
+         text_color = close > ema2 ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 8, "Volume",      text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 8, volOk ? str.tostring(volume, "#,###") : "LOW",
+         text_color = volOk ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 9, "Time",        text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 9, not regHoursOk ? "OUTSIDE HOURS" : inDeadZone ? "DEAD ZONE" : "ACTIVE",
+         text_color = not regHoursOk ? color.red : inDeadZone ? color.gray : color.green, text_size = size.tiny)
+
+    table.cell(dash, 0, 10, "Cooldown",    text_color = color.white, text_size = size.tiny)
+    table.cell(dash, 1, 10, cooldownActive ? str.tostring(cooldown) + " bars" : "CLEAR",
+         text_color = cooldownActive ? color.fuchsia : color.green, text_size = size.tiny)
+
+    table.cell(dash, 0, 11, "Paths",       text_color = color.white, text_size = size.tiny)
+    pathStatus = (enablePath1 ? "P1" : "") + (enablePath2 ? " P2" : "") + (enablePath3 ? " P3" : "")
+    table.cell(dash, 1, 11, pathStatus, text_color = color.aqua, text_size = size.tiny)
+
+    table.cell(dash, 0, 12, "Confirm",     text_color = color.white, text_size = size.tiny)
+    confirmInfo = confirmState == 0 ? "IDLE" : confirmState == 1 ? "WATCHING " + str.tostring(confirmCount) + "/" + str.tostring(confirmBars) + " (" + triggerPath + ")" : confirmState == 2 ? "READY " + triggerPath : "?"
+    confirmColor = confirmState == 0 ? color.gray : confirmState == 1 ? color.yellow : color.green
+    table.cell(dash, 1, 12, confirmInfo, text_color = confirmColor, text_size = size.tiny)
+
+    table.cell(dash, 0, 13, "Score",       text_color = color.white, text_size = size.tiny)
+    dashMinScore = triggerPath == "P3_SURGE" ? p3MinScore : minScore
+    scoreDetail = confirmState >= 1 ? str.tostring(qualityScore) + "/6 (need " + str.tostring(dashMinScore) + ")" : "-"
+    table.cell(dash, 1, 13, scoreDetail,
+         text_color = qualityScore >= dashMinScore ? color.green : color.gray, text_size = size.tiny)
+
+    table.cell(dash, 0, 14, "Position",    text_color = color.white, text_size = size.tiny)
+    posInfo = inPosition ? "LONG @ $" + str.tostring(entryPrice, "#.##") : "FLAT"
+    table.cell(dash, 1, 14, posInfo,
+         text_color = inPosition ? color.green : color.gray, text_size = size.tiny)
+
+    table.cell(dash, 0, 15, "Profit",     text_color = color.white, text_size = size.tiny)
+    profitInfo = inPosition ? str.tostring(profitPct, "#.##") + "% | Sold: " + str.tostring(soldPct) + "%" : "-"
+    table.cell(dash, 1, 15, profitInfo,
+         text_color = inPosition and profitPct > 0 ? color.green : inPosition and profitPct < 0 ? color.red : color.gray, text_size = size.tiny)
+
+    // v3.3: Floor + Tier info
+    table.cell(dash, 0, 16, "Floor",      text_color = color.white, text_size = size.tiny)
+    floorInfo = not inPosition ? "-" :
+         not useFloorSystem ? "OFF" :
+         floorActive ? str.tostring(profitFloor, "#.##") + "% ($" + str.tostring(floorPrice, "#.##") + ")" :
+         "waiting..."
+    table.cell(dash, 1, 16, floorInfo,
+         text_color = floorActive ? color.fuchsia : color.gray, text_size = size.tiny)
+
+    table.cell(dash, 0, 17, "Tier",       text_color = color.white, text_size = size.tiny)
+    tierInfo = not inPosition ? "-" :
+         profitTier == 1 ? "T1: K<" + str.tostring(stochExitLvl) + " exits" :
+         profitTier == 2 ? "T2: K<" + str.tostring(stochExitLvl) + "+EMA9" :
+         "T3: MACD only"
+    tierColor = profitTier == 1 ? color.orange : profitTier == 2 ? color.aqua : color.lime
+    table.cell(dash, 1, 17, tierInfo,
+         text_color = inPosition ? tierColor : color.gray, text_size = size.tiny)
+
+    table.cell(dash, 0, 18, "Scale",      text_color = color.white, text_size = size.tiny)
+    scaleInfo = not inPosition ? "-" :
+         hitFast4pct ? "FAST (" + str.tostring(scaleFast4Sell) + "% sold)" :
+         hit4after2 ? "4%>2% (" + str.tostring(soldPct) + "% sold)" :
+         hit2pct ? "2% (" + str.tostring(scale2pctSell) + "% sold)" :
+         "Waiting..."
+    table.cell(dash, 1, 18, scaleInfo,
+         text_color = soldPct >= 50 ? color.yellow : color.gray, text_size = size.tiny)
+
+    table.cell(dash, 0, 19, "EMA20 Gate",  text_color = color.white, text_size = size.tiny)
+    emaGateInfo = not requireAboveEMA ? "OFF" : emaGateOk ? "PASS (" + str.tostring(ema2, "#.##") + ")" : "BLOCKED (" + str.tostring(ema2, "#.##") + ")"
+    table.cell(dash, 1, 19, emaGateInfo,
+         text_color = not requireAboveEMA ? color.gray : emaGateOk ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 20, "StochK Gate", text_color = color.white, text_size = size.tiny)
+    stochKGateInfo = not useStochKCap ? "OFF" : stochKGateOk ? "PASS (K:" + str.tostring(stochK, "#.0") + ")" : "BLOCKED (K:" + str.tostring(stochK, "#.0") + ">=" + str.tostring(stochKCapLevel) + ")"
+    table.cell(dash, 1, 20, stochKGateInfo,
+         text_color = not useStochKCap ? color.gray : stochKGateOk ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 21, "EMA9 Dist", text_color = color.white, text_size = size.tiny)
+    ema9DistInfo = not useEMA9MaxDist ? "OFF" : ema9DistGateOk ? "PASS (" + str.tostring(ema9DistPct, "#.1") + "%)" : "BLOCKED (" + str.tostring(ema9DistPct, "#.1") + "%>=" + str.tostring(ema9MaxDistPct, "#.0") + "%)"
+    table.cell(dash, 1, 21, ema9DistInfo,
+         text_color = not useEMA9MaxDist ? color.gray : ema9DistGateOk ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 22, "VWAP Dist",  text_color = color.white, text_size = size.tiny)
+    vwapDistInfo = vwapMaxDistPct <= 0 ? "OFF" :
+         not inSession ? "N/A (pre/post mkt)" :
+         vwapDistGateOk ? "PASS (" + str.tostring(vwapDistPct, "#.1") + "%)" :
+         "BLOCKED (" + str.tostring(vwapDistPct, "#.1") + "%>=" + str.tostring(vwapMaxDistPct, "#.0") + "%)"
+    table.cell(dash, 1, 22, vwapDistInfo,
+         text_color = vwapMaxDistPct <= 0 ? color.gray : not inSession ? color.gray : vwapDistGateOk ? color.green : color.red, text_size = size.tiny)
+
+    table.cell(dash, 0, 23, "Entry",      text_color = color.white, text_size = size.tiny)
+    entryStatus = entrySignal ? "BUY " + entryPath : inPosition ? "- in position" : not regHoursOk ? "X outside hours" : not emaGateOk ? "X below EMA20" : not stochKGateOk ? "X StochK overbought" : not ema9DistGateOk ? "X EMA9 too far" : not vwapDistGateOk ? "X VWAP too far (" + str.tostring(vwapDistPct, "#.1") + "%)" : not macdAboveSignal ? "X MACD bearish" : confirmState == 1 ? "CONFIRMING " + triggerPath : inDeadZone ? "X dead zone" : cooldownActive ? "X cooldown" : "Waiting..."
+    table.cell(dash, 1, 23, entryStatus,
+         text_color = entrySignal ? color.green : confirmState == 1 ? color.yellow : color.gray, text_size = size.tiny)

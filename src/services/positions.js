@@ -11,7 +11,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { log, journalTrade, generateTradeId, setTradeId, getTradeId, clearTradeId } = require('./logger');
+const { log, journalTrade, generateTradeId, setTradeId, clearTradeId } = require('./logger');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '../../data');
 const POSITIONS_FILE = path.join(DATA_DIR, 'positions.json');
