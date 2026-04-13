@@ -495,6 +495,13 @@ exitProfitPct  = profitPct
 exitPeakPct    = maxProfitPct
 exitTier       = profitTier
 
+// JSON-safe number formatting for webhook payloads.
+// Leading-zero masks prevent invalid JSON like ".0" or "-.5".
+jsonPrice(v) => str.tostring(v, "0.####")
+jsonPct(v)   => str.tostring(v, "0.##")
+json1(v)     => str.tostring(v, "0.0")
+json6(v)     => str.tostring(v, "0.######")
+
 if entrySignal
     inPosition      := true
     entryPrice      := close
@@ -510,24 +517,24 @@ if entrySignal
     maxProfitPct    := 0.0
     profitFloor     := -999.0
     floorActive     := false
-    alert('{"action":"BUY","path":"' + entryPath + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"volume":' + str.tostring(volume) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"stochKprev":' + str.tostring(stochK[1], "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"signal":' + str.tostring(signalValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"ema9":' + str.tostring(ema1, "#.####") + ',"ema20":' + str.tostring(ema2, "#.####") + ',"vwap":' + str.tostring(sessVwap, "#.####") + ',"score":' + str.tostring(qualityScore) + ',"confirmBars":' + str.tostring(confirmCount) + ',"crossPrice":' + str.tostring(crossPrice) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"BUY","path":"' + entryPath + '","ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"volume":' + str.tostring(volume) + ',"stochK":' + json1(stochK) + ',"stochKprev":' + json1(stochK[1]) + ',"macd":' + json6(macdValue) + ',"signal":' + json6(signalValue) + ',"hist":' + json6(histValue) + ',"ema9":' + jsonPrice(ema1) + ',"ema20":' + jsonPrice(ema2) + ',"vwap":' + jsonPrice(sessVwap) + ',"score":' + str.tostring(qualityScore) + ',"confirmBars":' + str.tostring(confirmCount) + ',"crossPrice":' + jsonPrice(crossPrice) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 
 // Scale exits — else-if chain (one per bar)
 if scaleFast4
     hitFast4pct       := true
     soldPct           := scaleFast4Sell
     lastScaleFast4Bar := bar_index
-    alert('{"action":"SCALE","level":"FAST4","sell_pct":' + str.tostring(scaleFast4Sell) + ',"ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"SCALE","level":"FAST4","sell_pct":' + str.tostring(scaleFast4Sell) + ',"ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"stochK":' + json1(stochK) + ',"macd":' + json6(macdValue) + ',"hist":' + json6(histValue) + ',"profitPct":' + jsonPct(profitPct) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 else if scale2pct
     hit2pct      := true
     soldPct      := scale2pctSell
     lastScale2Bar := bar_index
-    alert('{"action":"SCALE","level":"PCT2","sell_pct":' + str.tostring(scale2pctSell) + ',"ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"SCALE","level":"PCT2","sell_pct":' + str.tostring(scale2pctSell) + ',"ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"stochK":' + json1(stochK) + ',"macd":' + json6(macdValue) + ',"hist":' + json6(histValue) + ',"profitPct":' + jsonPct(profitPct) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 else if scale4after2
     hit4after2    := true
     soldPct       := soldPct + scale4after2Sell
     lastScale4a2Bar := bar_index
-    alert('{"action":"SCALE","level":"PCT4_AFTER2","sell_pct":' + str.tostring(scale4after2Sell) + ',"ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"SCALE","level":"PCT4_AFTER2","sell_pct":' + str.tostring(scale4after2Sell) + ',"ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"stochK":' + json1(stochK) + ',"macd":' + json6(macdValue) + ',"hist":' + json6(histValue) + ',"profitPct":' + jsonPct(profitPct) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 
 // v3.3: Exit with reason — separate handlers for proper reason tagging
 if exitFloorBreach and not exitMacdBear
@@ -540,7 +547,7 @@ if exitFloorBreach and not exitMacdBear
     maxProfitPct   := 0.0
     profitFloor    := -999.0
     floorActive    := false
-    alert('{"action":"CLOSE","reason":"FLOOR_BREACH","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"floorPct":' + str.tostring(profitFloor, "#.##") + ',"maxProfitPct":' + str.tostring(maxProfitPct, "#.##") + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"CLOSE","reason":"FLOOR_BREACH","ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"stochK":' + json1(stochK) + ',"macd":' + json6(macdValue) + ',"hist":' + json6(histValue) + ',"profitPct":' + jsonPct(profitPct) + ',"floorPct":' + jsonPct(profitFloor) + ',"maxProfitPct":' + jsonPct(maxProfitPct) + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 
 else if exitMacdBear
     inPosition     := false
@@ -552,7 +559,7 @@ else if exitMacdBear
     maxProfitPct   := 0.0
     profitFloor    := -999.0
     floorActive    := false
-    alert('{"action":"CLOSE","reason":"MACD_BEAR","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"CLOSE","reason":"MACD_BEAR","ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"stochK":' + json1(stochK) + ',"macd":' + json6(macdValue) + ',"hist":' + json6(histValue) + ',"profitPct":' + jsonPct(profitPct) + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 
 else if exitStochTier2
     inPosition     := false
@@ -564,7 +571,7 @@ else if exitStochTier2
     maxProfitPct   := 0.0
     profitFloor    := -999.0
     floorActive    := false
-    alert('{"action":"CLOSE","reason":"STOCHK_TIER2_' + str.tostring(stochExitLvl) + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"tier":2,"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"CLOSE","reason":"STOCHK_TIER2_' + str.tostring(stochExitLvl) + '","ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"stochK":' + json1(stochK) + ',"macd":' + json6(macdValue) + ',"hist":' + json6(histValue) + ',"profitPct":' + jsonPct(profitPct) + ',"tier":2,"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 
 else if exitStochTier1
     inPosition     := false
@@ -576,12 +583,12 @@ else if exitStochTier1
     maxProfitPct   := 0.0
     profitFloor    := -999.0
     floorActive    := false
-    alert('{"action":"CLOSE","reason":"STOCHK_TIER1_' + str.tostring(stochExitLvl) + '","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"stochK":' + str.tostring(stochK, "#.0") + ',"macd":' + str.tostring(macdValue, "#.######") + ',"hist":' + str.tostring(histValue, "#.######") + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"tier":1,"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"CLOSE","reason":"STOCHK_TIER1_' + str.tostring(stochExitLvl) + '","ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"stochK":' + json1(stochK) + ',"macd":' + json6(macdValue) + ',"hist":' + json6(histValue) + ',"profitPct":' + jsonPct(profitPct) + ',"tier":1,"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 
 // v3.3: Heartbeat includes floor data for server stop ratchet
 if heartbeatSignal
     lastHeartbeatBar := bar_index
-    alert('{"action":"HEARTBEAT","ticker":"' + syminfo.ticker + '","price":' + str.tostring(close) + ',"profitPct":' + str.tostring(profitPct, "#.##") + ',"floorPct":' + str.tostring(floorActive ? profitFloor : 0, "#.##") + ',"floorPrice":' + str.tostring(floorActive ? floorPrice : 0, "#.####") + ',"maxProfitPct":' + str.tostring(maxProfitPct, "#.##") + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
+    alert('{"action":"HEARTBEAT","ticker":"' + syminfo.ticker + '","price":' + jsonPrice(close) + ',"profitPct":' + jsonPct(profitPct) + ',"floorPct":' + jsonPct(floorActive ? profitFloor : 0) + ',"floorPrice":' + jsonPrice(floorActive ? floorPrice : 0) + ',"maxProfitPct":' + jsonPct(maxProfitPct) + ',"tier":' + str.tostring(profitTier) + ',"token":"' + webhookToken + '"}', alert.freq_once_per_bar)
 
 // --- PLOTS -----------------------------------------------------------
 

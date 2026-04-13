@@ -15,6 +15,7 @@ const { log, journalTrade, generateTradeId, setTradeId, clearTradeId } = require
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '../../data');
 const POSITIONS_FILE = path.join(DATA_DIR, 'positions.json');
+const PENDING_FILE = path.join(DATA_DIR, 'pending.json');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 // Ensure data directory exists
@@ -22,16 +23,64 @@ try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { /* ok */ }
 
 // --- In-Memory State ---
 const positions = new Map();
+const pendingEntries = new Map();
 let dailyPnL = 0, dailyTradeCount = 0, lastResetDate = new Date().toDateString();
 const recentAlerts = new Map();
 const DEDUP_WINDOW_MS = parseInt(process.env.DEDUP_WINDOW_MS || '5000');
+
+function getInitialHardStop(entryPrice) {
+    const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
+    return entryPrice > 0 ? parseFloat((entryPrice - stopCents).toFixed(2)) : 0;
+}
+
+function buildEntryData(webhookData = {}) {
+    return {
+        path: webhookData.path || 'unknown',
+        score: webhookData.score || null,
+        stochK: webhookData.stochK || null,
+        macd: webhookData.macd || null,
+        hist: webhookData.hist || null,
+        vwap: webhookData.vwap || null,
+        ema9: webhookData.ema9 || null,
+        ema20: webhookData.ema20 || null,
+        volume: webhookData.volume || null
+    };
+}
+
+function createPositionRecord(ticker, entryPrice, quantity, webhookData = {}, overrides = {}) {
+    const tradeId = overrides.tradeId || generateTradeId(ticker);
+    const enteredAt = overrides.enteredAt || new Date().toISOString();
+
+    return {
+        ticker,
+        tradeId,
+        entryPrice,
+        initialQuantity: quantity,
+        remainingQuantity: quantity,
+        enteredAt,
+        hit2pct: overrides.hit2pct || false,
+        hitFast4pct: overrides.hitFast4pct || false,
+        hit4after2: overrides.hit4after2 || false,
+        soldPct: overrides.soldPct || 0,
+        scaledExits: overrides.scaledExits || [],
+        isOrphan: overrides.isOrphan || false,
+        orphanDetectedAt: overrides.orphanDetectedAt || null,
+        lastSignalTime: overrides.lastSignalTime || Date.now(),
+        entryData: overrides.entryData || buildEntryData(webhookData),
+        stopOrderId: overrides.stopOrderId || null,
+        currentStopPrice: overrides.currentStopPrice || getInitialHardStop(entryPrice)
+    };
+}
 
 // --- Persistence: Save ---
 function saveToDisk() {
     try {
         const posData = {};
         for (const [k, v] of positions) { posData[k] = v; }
+        const pendingData = {};
+        for (const [k, v] of pendingEntries) { pendingData[k] = v; }
         fs.writeFileSync(POSITIONS_FILE, JSON.stringify(posData, null, 2));
+        fs.writeFileSync(PENDING_FILE, JSON.stringify(pendingData, null, 2));
         fs.writeFileSync(STATE_FILE, JSON.stringify({
             dailyPnL, dailyTradeCount, lastResetDate,
             savedAt: new Date().toISOString()
@@ -60,6 +109,25 @@ function loadFromDisk() {
         }
     } catch (e) {
         log('WARN', 'Could not load positions from disk', { error: e.message });
+    }
+
+    try {
+        if (fs.existsSync(PENDING_FILE)) {
+            const raw = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf8'));
+            let loaded = 0;
+            for (const [ticker, entry] of Object.entries(raw)) {
+                pendingEntries.set(ticker, entry);
+                if (entry.tradeId) setTradeId(ticker, entry.tradeId);
+                loaded++;
+            }
+            if (loaded > 0) {
+                log('INFO', `Restored ${loaded} pending entr${loaded === 1 ? 'y' : 'ies'} from disk`, {
+                    tickers: Object.keys(raw)
+                });
+            }
+        }
+    } catch (e) {
+        log('WARN', 'Could not load pending entries from disk', { error: e.message });
     }
 
     try {
@@ -121,56 +189,25 @@ function isWithinTradingHours() {
 function canOpenPosition(ticker) {
     resetDailyIfNeeded();
     if (positions.has(ticker)) return { allowed: false, reason: `Already holding ${ticker}` };
-    if (positions.size >= parseInt(process.env.MAX_POSITIONS || '3')) return { allowed: false, reason: 'Max positions' };
+    if (pendingEntries.has(ticker)) return { allowed: false, reason: `Pending entry for ${ticker}` };
+    if ((positions.size + pendingEntries.size) >= parseInt(process.env.MAX_POSITIONS || '3')) return { allowed: false, reason: 'Max positions' };
     if (dailyPnL <= parseFloat(process.env.MAX_DAILY_LOSS || '-500')) return { allowed: false, reason: 'Daily loss limit' };
     if (!isWithinTradingHours()) return { allowed: false, reason: 'Outside trading hours' };
     return { allowed: true };
 }
 
 // --- Open Position ---
-function openPosition(ticker, entryPrice, quantity, webhookData = {}) {
-    const tradeId = generateTradeId(ticker);
-    setTradeId(ticker, tradeId);
-
-    const pos = {
-        ticker,
-        tradeId,
-        entryPrice,
-        initialQuantity: quantity,
-        remainingQuantity: quantity,
-        enteredAt: new Date().toISOString(),
-        hit2pct: false,
-        hitFast4pct: false,
-        hit4after2: false,
-        soldPct: 0,
-        scaledExits: [],
-        isOrphan: false,
-        orphanDetectedAt: null,
-        lastSignalTime: Date.now(),
-        // v1.3.0: Store the full webhook data for post-analysis
-        entryData: {
-            path: webhookData.path || 'unknown',
-            score: webhookData.score || null,
-            stochK: webhookData.stochK || null,
-            macd: webhookData.macd || null,
-            hist: webhookData.hist || null,
-            vwap: webhookData.vwap || null,
-            ema9: webhookData.ema9 || null,
-            ema20: webhookData.ema20 || null,
-            volume: webhookData.volume || null
-        },
-        // v1.3.0: Stop loss tracking
-        stopOrderId: null,
-        currentStopPrice: 0
-    };
-
+function openPosition(ticker, entryPrice, quantity, webhookData = {}, overrides = {}) {
+    const pos = createPositionRecord(ticker, entryPrice, quantity, webhookData, overrides);
+    setTradeId(ticker, pos.tradeId);
     positions.set(ticker, pos);
+    pendingEntries.delete(ticker);
     dailyTradeCount++;
     saveToDisk();
 
     journalTrade({
         action: 'BUY',
-        tradeId,
+        tradeId: pos.tradeId,
         ticker,
         entryPrice,
         quantity,
@@ -178,8 +215,102 @@ function openPosition(ticker, entryPrice, quantity, webhookData = {}) {
     });
 
     log('POSITION', `Opened ${ticker}: ${quantity} @ $${entryPrice.toFixed(2)}`, {
-        tradeId, path: pos.entryData.path, score: pos.entryData.score
+        tradeId: pos.tradeId, path: pos.entryData.path, score: pos.entryData.score
     });
+}
+
+function createPendingEntry(ticker, signalPrice, quantity, orderId, webhookData = {}, meta = {}) {
+    const tradeId = generateTradeId(ticker);
+    const pending = {
+        ticker,
+        tradeId,
+        signalPrice,
+        requestedQuantity: quantity,
+        orderId,
+        createdAt: new Date().toISOString(),
+        lastSignalTime: Date.now(),
+        session: meta.session || 'UNKNOWN',
+        orderType: meta.orderType || 'UNKNOWN',
+        entryData: buildEntryData(webhookData)
+    };
+
+    setTradeId(ticker, tradeId);
+    pendingEntries.set(ticker, pending);
+    saveToDisk();
+
+    log('POSITION', `Pending entry ${ticker}: ${quantity} @ $${signalPrice.toFixed(2)}`, {
+        tradeId,
+        orderId,
+        session: pending.session,
+        orderType: pending.orderType
+    });
+
+    return pending;
+}
+
+function activatePendingEntry(ticker, entryPrice, quantity, details = {}) {
+    const pending = pendingEntries.get(ticker);
+    if (!pending) return null;
+
+    const pos = createPositionRecord(
+        ticker,
+        entryPrice,
+        quantity,
+        pending.entryData,
+        {
+            tradeId: pending.tradeId,
+            enteredAt: details.enteredAt || new Date().toISOString(),
+            lastSignalTime: pending.lastSignalTime
+        }
+    );
+
+    positions.set(ticker, pos);
+    pendingEntries.delete(ticker);
+    dailyTradeCount++;
+    saveToDisk();
+
+    journalTrade({
+        action: 'BUY',
+        tradeId: pos.tradeId,
+        ticker,
+        entryPrice,
+        quantity,
+        ...pos.entryData
+    });
+
+    log('POSITION', `Activated ${ticker}: ${quantity} @ $${entryPrice.toFixed(2)}`, {
+        tradeId: pos.tradeId,
+        orderId: pending.orderId,
+        activationSource: details.source || 'unknown'
+    });
+
+    return pos;
+}
+
+function getPendingEntry(ticker) {
+    return pendingEntries.get(ticker) || null;
+}
+
+function hasPendingEntry(ticker) {
+    return pendingEntries.has(ticker);
+}
+
+function getAllPendingEntries() {
+    return Array.from(pendingEntries.values());
+}
+
+function clearPendingEntry(ticker, reason = 'cleared') {
+    const pending = pendingEntries.get(ticker);
+    if (!pending) return null;
+    pendingEntries.delete(ticker);
+    clearTradeId(ticker);
+    saveToDisk();
+    log('POSITION', `Cleared pending entry ${ticker}`, {
+        tradeId: pending.tradeId,
+        reason,
+        orderId: pending.orderId
+    });
+    return pending;
 }
 
 // --- Touch (Heartbeat) ---
@@ -187,7 +318,12 @@ function getPosition(ticker) { return positions.get(ticker) || null; }
 
 function touchPosition(ticker) {
     const p = positions.get(ticker);
-    if (p) { p.lastSignalTime = Date.now(); }
+    if (p) {
+        p.lastSignalTime = Date.now();
+        return;
+    }
+    const pending = pendingEntries.get(ticker);
+    if (pending) pending.lastSignalTime = Date.now();
 }
 
 // v1.3.0: Stop loss tracking
@@ -226,6 +362,15 @@ function updateStopPrice(ticker, newStopPrice, newOrderId) {
     }
 }
 
+function isMilestoneHit(ticker, milestone) {
+    const p = positions.get(ticker);
+    if (!p) return false;
+    if (milestone === 'PCT2') return !!p.hit2pct;
+    if (milestone === 'FAST4') return !!p.hitFast4pct;
+    if (milestone === 'PCT4_AFTER2') return !!p.hit4after2;
+    return false;
+}
+
 // --- Heartbeat Expired ---
 function getHeartbeatExpired(timeoutSecs) {
     const r = [], now = Date.now();
@@ -260,14 +405,30 @@ function getOrphans(mins) {
 }
 
 // --- Scale Position ---
+function previewScalePosition(ticker, sellPct, price = 0) {
+    const p = positions.get(ticker);
+    if (!p) return null;
+
+    const sharesToSell = Math.min(
+        Math.floor(p.initialQuantity * (sellPct / 100)),
+        p.remainingQuantity
+    );
+    if (sharesToSell <= 0) {
+        return { sharesToSell: 0, pnl: 0 };
+    }
+
+    return {
+        sharesToSell,
+        pnl: (price - p.entryPrice) * sharesToSell
+    };
+}
+
 function scalePosition(ticker, sellPct, reason, price) {
     const p = positions.get(ticker);
     if (!p) return null;
 
-    const sell = Math.min(
-        Math.floor(p.initialQuantity * (sellPct / 100)),
-        p.remainingQuantity
-    );
+    const preview = previewScalePosition(ticker, sellPct, price);
+    const sell = preview?.sharesToSell || 0;
     if (sell <= 0) {
         log('WARN', `Scale ${ticker}: 0 shares to sell`, {
             tradeId: p.tradeId, sellPct, remaining: p.remainingQuantity
@@ -398,7 +559,18 @@ function getStatus() {
             entryPath: p.entryData?.path,
             entryScore: p.entryData?.score
         })),
+        pendingEntries: Array.from(pendingEntries.values()).map(p => ({
+            ticker: p.ticker,
+            tradeId: p.tradeId,
+            signalPrice: p.signalPrice,
+            requestedQuantity: p.requestedQuantity,
+            orderId: p.orderId,
+            session: p.session,
+            orderType: p.orderType,
+            ageSecs: Math.round((Date.now() - new Date(p.createdAt).getTime()) / 1000)
+        })),
         positionCount: positions.size,
+        pendingCount: pendingEntries.size,
         dailyPnL: dailyPnL.toFixed(2),
         dailyTradeCount,
         maxPositions: parseInt(process.env.MAX_POSITIONS || '3')
@@ -407,9 +579,11 @@ function getStatus() {
 
 module.exports = {
     positions: {
-        isDuplicate, canOpenPosition, openPosition, getPosition,
+        isDuplicate, canOpenPosition, openPosition,
+        createPendingEntry, activatePendingEntry, getPendingEntry, hasPendingEntry, getAllPendingEntries, clearPendingEntry,
+        getPosition,
         touchPosition, setStopOrder, getStopPrice, getStopOrderId, updateStopPrice,
-        getHeartbeatExpired, scalePosition, closePosition,
-        markMilestone, getStatus, getAllPositions, markOrphan, getOrphans
+        getHeartbeatExpired, previewScalePosition, scalePosition, closePosition,
+        markMilestone, isMilestoneHit, getStatus, getAllPositions, markOrphan, getOrphans
     }
 };

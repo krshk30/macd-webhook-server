@@ -12,6 +12,7 @@ This note captures the first cleanup pass across the active Railway server code 
 - Added a basic automated test suite using Node's built-in test runner.
 - Added webhook route tests for auth, heartbeat, and blocked-entry behavior.
 - Added webhook route tests for server-owned `SCALE` and `CLOSE` execution behavior.
+- Hardened webhook parsing so `text/plain` bodies containing JSON are accepted and parsed before auth validation.
 - Removed clearly non-active legacy runtime files from the repo root.
 - Removed `src/server-patch.js`, which was a historical patch artifact rather than runtime code.
 
@@ -21,6 +22,7 @@ This note captures the first cleanup pass across the active Railway server code 
 - Removed unused variable `exitReason`.
 - Removed unused variable `exitSignal`.
 - Updated the dashboard title from `Confirmed v3.3` to `Confirmed v3.4.2` so the visible version matches the file header.
+- Replaced risky webhook number formats like `"#.0"` and `"#.##"` with JSON-safe helpers that preserve leading zeroes.
 
 ## Validation Completed
 
@@ -33,6 +35,7 @@ This note captures the first cleanup pass across the active Railway server code 
   - `CLOSE`
   - `HEARTBEAT`
 - Added a root `.gitignore` so `node_modules/`, `.env`, runtime logs, and data files stay out of Git noise.
+- Added regression coverage for plain-text TradingView webhook delivery and JSON-safe Pine alert formatting.
 
 ## Current Test Coverage
 

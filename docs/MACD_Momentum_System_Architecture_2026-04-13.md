@@ -34,9 +34,10 @@ TradingView Pine Script
 
 Server background jobs
   -> token refresh
+  -> pending entry fill checks
   -> heartbeat expiry checks
   -> orphan position checks
-  -> floor monitor / stop ratcheting
+  -> server-managed hard stop / scale / floor monitor
   -> logging and journaling
 ```
 
@@ -135,6 +136,7 @@ The Node server is an execution and state-management layer, not a strategy engin
 - reject invalid or duplicate signals
 - place orders through Schwab
 - track positions locally
+- confirm pending limit entries against Schwab account positions before treating them as live
 - persist state across restarts
 - notify Discord
 - reconcile server state against Schwab account state
@@ -157,9 +159,9 @@ On `BUY`, the server:
 
 - validates the token
 - checks whether a position may be opened
-- places a Schwab `TRIGGER` order
-- uses a protective child stop order
-- opens a local position record
+- places a plain Schwab entry order
+- opens a local position immediately for normal-session marketable entries
+- stores a pending entry for extended-hours limit orders until Schwab shows a real fill
 - stores the Pine snapshot for later analysis
 
 ### SCALE Handling
@@ -167,22 +169,21 @@ On `BUY`, the server:
 On `SCALE`, the server:
 
 - confirms a tracked position exists
-- cancels tracked stops and working orders for that ticker
 - calculates shares from `sell_pct`
-- updates milestone state
-- either:
-  - places a sell plus child stop for the remaining shares
-  - or places a full sell if nothing remains
+- ignores duplicate milestone alerts if the server already executed that same scale
+- sends a plain sell order for the requested shares
+- updates local milestone and remaining position state only after the sell request succeeds
 
 ### CLOSE Handling
 
 On `CLOSE`, the server:
 
 - marks the position as closing
-- cancels tracked stops and working orders
+- cancels working orders for that ticker
 - waits briefly for cancellation settlement
 - sells remaining shares
 - closes local state and journals P&L
+- cancels pending entries cleanly if a close arrives before an extended-hours limit buy fills
 
 ### HEARTBEAT Handling
 
@@ -191,6 +192,17 @@ On `HEARTBEAT`, the server:
 - refreshes the position's `lastSignalTime`
 - returns current remaining quantity and stop data
 - relies on background monitors to act if heartbeat disappears
+
+## Server-Owned Protection
+
+The current implementation intentionally moved active protection responsibility onto the server instead of relying on attached Schwab child stop orders.
+
+- Hard stop is enforced by the server using quote polling, not a broker-attached stop.
+- Profit floor and ratcheting are enforced by the same server monitor.
+- Price-based scale milestones can also be executed by the server using configured thresholds.
+- Pine still remains the source of truth for indicator-based invalidation exits such as `MACD_BEAR` and `STOCHK_*`.
+
+This split keeps Pine as the chart and indicator source while letting the server own broker-safe execution logic across regular, pre-market, and post-market sessions.
 
 ## Webhook Contract
 

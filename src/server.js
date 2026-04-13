@@ -11,6 +11,25 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10kb' }));
+app.use(express.text({ type: ['text/plain', 'text/*'], limit: '10kb' }));
+
+// TradingView can occasionally deliver a JSON-looking payload as text/plain.
+// Parse it here so a missing parsed body does not get misreported as auth failure.
+app.use((req, res, next) => {
+    if (req.method === 'POST' && req.path === '/webhook' && typeof req.body === 'string') {
+        try {
+            req.body = JSON.parse(req.body);
+        } catch (err) {
+            log('ERROR', 'Plain-text webhook body was not valid JSON', {
+                ip: req.ip,
+                contentType: req.headers['content-type'],
+                bodyPreview: req.body.substring(0, 200)
+            });
+            return res.status(400).json({ error: 'invalid JSON' });
+        }
+    }
+    next();
+});
 
 // Catch JSON parse errors — log what was received
 app.use((err, req, res, next) => {
@@ -38,5 +57,6 @@ app.listen(PORT, () => {
     const { positions } = require('./services/positions');
     schwabService.startOrphanCheck(positions);
     schwabService.startHeartbeatCheck(positions);
+    schwabService.startPendingEntryMonitor(positions);
     schwabService.startFloorMonitor(positions);
 });

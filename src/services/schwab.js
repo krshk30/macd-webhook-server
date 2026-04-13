@@ -19,7 +19,7 @@ const https = require('https');
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
-let accountHash = null, refreshTimer = null, orphanCheckTimer = null, heartbeatTimer = null;
+let accountHash = null, refreshTimer = null, orphanCheckTimer = null, heartbeatTimer = null, pendingEntryTimer = null;
 
 const api = axios.create({
     baseURL: SCHWAB_API_BASE,
@@ -36,10 +36,24 @@ function getEasternTime() { return new Date(new Date().toLocaleString('en-US', {
 function isRegularHours() { const et = getEasternTime(); const m = et.getHours() * 60 + et.getMinutes(); return m >= 570 && m < 960; }
 function getSessionType() { return isRegularHours() ? 'NORMAL' : 'SEAMLESS'; }
 function getLimitBuffer() { return parseFloat(process.env.LIMIT_BUFFER_CENTS || '0.01'); }
+function getFloorCheckIntervalSecs() { return parseInt(process.env.FLOOR_CHECK_INTERVAL_SECS || '5'); }
+function getPendingEntryCheckIntervalSecs() { return parseInt(process.env.PENDING_ENTRY_CHECK_INTERVAL_SECS || '2'); }
+function getPendingEntryTimeoutSecs() { return parseInt(process.env.PENDING_ENTRY_TIMEOUT_SECS || '120'); }
+function isServerManagedScalesEnabled() { return process.env.SERVER_MANAGED_SCALES !== 'false'; }
 function getOrderType(req, price) {
     if (isRegularHours()) return req;
     if (req === 'MARKET' && price > 0) { log('ORDER', 'Ext hours: MARKET → LIMIT'); return 'LIMIT'; }
     return req;
+}
+function getScaleConfig() {
+    return {
+        fast4Thresh: parseFloat(process.env.SCALE_FAST4_THRESHOLD || '4'),
+        fast4SellPct: parseInt(process.env.SCALE_FAST4_SELL_PCT || '75'),
+        pct2Thresh: parseFloat(process.env.SCALE_PCT2_THRESHOLD || '2'),
+        pct2SellPct: parseInt(process.env.SCALE_PCT2_SELL_PCT || '50'),
+        pct4After2Thresh: parseFloat(process.env.SCALE_PCT4_AFTER2_THRESHOLD || '4'),
+        pct4After2SellPct: parseInt(process.env.SCALE_PCT4_AFTER2_SELL_PCT || '25')
+    };
 }
 
 function getAuthUrl() {
@@ -137,22 +151,46 @@ async function getPositionsFromSchwab() {
     }
 }
 
+function findBrokerPosition(positions, ticker) {
+    return (positions || []).find(p => p.instrument?.symbol === ticker && (p.longQuantity || 0) > 0) || null;
+}
+
 async function getCurrentPrice(ticker) {
+    const prices = await getCurrentPrices([ticker]);
+    return prices[ticker] || 0;
+}
+
+async function getCurrentPrices(tickers) {
+    const uniqueTickers = Array.from(new Set((tickers || []).filter(Boolean)));
+    if (uniqueTickers.length === 0) return {};
+
     try {
         const r = await axios.get(`${SCHWAB_MARKETDATA_BASE}/quotes`, {
             headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Accept': 'application/json' },
-            params: { symbols: ticker, fields: 'quote' },
+            params: { symbols: uniqueTickers.join(','), fields: 'quote' },
             httpsAgent: keepAliveAgent, timeout: 5000
         });
-        const quote = r.data?.[ticker]?.quote || {};
-        const bidPrice = quote.bidPrice || 0;
-        const lastPrice = quote.lastPrice || 0;
-        const price = bidPrice > 0 ? bidPrice : lastPrice;
-        log('INFO', `Current price ${ticker}`, { bid: bidPrice, last: lastPrice, using: price });
-        return price;
+
+        const prices = {};
+        for (const ticker of uniqueTickers) {
+            const quote = r.data?.[ticker]?.quote || {};
+            const bidPrice = quote.bidPrice || 0;
+            const lastPrice = quote.lastPrice || 0;
+            const price = bidPrice > 0 ? bidPrice : lastPrice;
+            prices[ticker] = price;
+            log('INFO', `Current price ${ticker}`, { bid: bidPrice, last: lastPrice, using: price });
+        }
+
+        return prices;
     } catch (e) {
-        log('WARN', `Price fetch failed: ${ticker}`, { error: e.response?.status || e.message });
-        return 0;
+        log('WARN', 'Batch price fetch failed', {
+            tickers: uniqueTickers,
+            error: e.response?.status || e.message
+        });
+
+        const prices = {};
+        for (const ticker of uniqueTickers) prices[ticker] = 0;
+        return prices;
     }
 }
 
@@ -690,11 +728,269 @@ async function checkFloors(pt) {
     }
 }
 
+async function placeManagedBuyOrder(ticker, quantity, price) {
+    const t0 = Date.now();
+    const session = getSessionType();
+    const buyOrderType = getOrderType('MARKET', price);
+    const buffer = getLimitBuffer();
+    const order = {
+        orderStrategyType: 'SINGLE',
+        orderType: buyOrderType,
+        session,
+        duration: 'DAY',
+        orderLegCollection: [{
+            instruction: 'BUY',
+            quantity,
+            instrument: { symbol: ticker, assetType: 'EQUITY' }
+        }]
+    };
+
+    if (buyOrderType === 'LIMIT' && price > 0) {
+        order.price = parseFloat((price + buffer).toFixed(2));
+    }
+
+    log('ORDER', `BUY ${quantity} ${ticker}`, {
+        buyType: buyOrderType,
+        session,
+        signalPrice: price,
+        limitPrice: order.price || null
+    });
+
+    try {
+        const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
+        const latency = Date.now() - t0;
+        const orderId = r.headers.location?.split('/').pop();
+        log('ORDER', `BUY placed ${quantity} ${ticker}`, {
+            orderId,
+            session,
+            latency,
+            orderType: buyOrderType
+        });
+        await notify(`BUY ${quantity} ${ticker} | ${buyOrderType} ${session} | ${latency}ms`, 'buy');
+        return {
+            success: true,
+            orderId,
+            latency,
+            orderType: buyOrderType,
+            session,
+            needsFillConfirmation: buyOrderType === 'LIMIT'
+        };
+    } catch (e) {
+        log('ERROR', `BUY failed: ${ticker}`, {
+            error: e.response?.data?.message || e.message,
+            statusCode: e.response?.status
+        });
+        return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 };
+    }
+}
+
+async function syncPendingEntries(pt, ticker = null) {
+    if (!isAuthenticated()) return [];
+
+    const pendingEntries = ticker
+        ? [pt.getPendingEntry(ticker)].filter(Boolean)
+        : pt.getAllPendingEntries();
+
+    if (!pendingEntries.length) return [];
+
+    const brokerPositions = await getPositionsFromSchwab();
+    const activated = [];
+    const now = Date.now();
+
+    for (const pending of pendingEntries) {
+        const brokerPos = findBrokerPosition(brokerPositions, pending.ticker);
+        if (brokerPos) {
+            const quantity = brokerPos.longQuantity || pending.requestedQuantity || 0;
+            const fillPrice = brokerPos.averagePrice || pending.signalPrice || 0;
+            const pos = pt.activatePendingEntry(pending.ticker, fillPrice, quantity, {
+                source: 'schwab_positions'
+            });
+            if (pos) {
+                activated.push(pos);
+                await notify(
+                    `ENTRY CONFIRMED ${pending.ticker}\n` +
+                    `TradeID: ${pos.tradeId}\n` +
+                    `Qty: ${quantity} @ $${fillPrice.toFixed(2)}`,
+                    'buy'
+                );
+            }
+            continue;
+        }
+
+        const ageSecs = Math.round((now - new Date(pending.createdAt).getTime()) / 1000);
+        if (ageSecs >= getPendingEntryTimeoutSecs()) {
+            log('WARN', `Pending entry still unfilled: ${pending.ticker}`, {
+                tradeId: pending.tradeId,
+                orderId: pending.orderId,
+                ageSecs
+            });
+        }
+    }
+
+    return activated;
+}
+
+function decideServerScale(pos, profitPct) {
+    if (!isServerManagedScalesEnabled()) return null;
+
+    const config = getScaleConfig();
+    if (profitPct >= config.fast4Thresh && !pos.hit2pct && !pos.hitFast4pct) {
+        return { level: 'FAST4', sellPct: config.fast4SellPct };
+    }
+    if (profitPct >= config.pct2Thresh && !pos.hit2pct && !pos.hitFast4pct) {
+        return { level: 'PCT2', sellPct: config.pct2SellPct };
+    }
+    if (profitPct >= config.pct4After2Thresh && pos.hit2pct && !pos.hit4after2) {
+        return { level: 'PCT4_AFTER2', sellPct: config.pct4After2SellPct };
+    }
+    return null;
+}
+
+async function checkManagedExits(pt) {
+    if (!isAuthenticated()) return;
+
+    await syncPendingEntries(pt);
+
+    const allPositions = pt.getAllPositions().filter(pos => pos.remainingQuantity > 0 && !pos.isClosing && !pos.isOrphan);
+    if (allPositions.length === 0) return;
+
+    const prices = await getCurrentPrices(allPositions.map(pos => pos.ticker));
+    const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
+
+    for (const pos of allPositions) {
+        const currentPrice = prices[pos.ticker] || 0;
+        if (currentPrice <= 0) continue;
+
+        const profitPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+        const hardStopPrice = pos.entryPrice - stopCents;
+
+        if (currentPrice <= hardStopPrice) {
+            log('FLOOR', `HARD STOP: ${pos.ticker} price $${currentPrice.toFixed(2)} <= stop $${hardStopPrice.toFixed(2)}`, {
+                tradeId: pos.tradeId,
+                entryPrice: pos.entryPrice,
+                profitPct: profitPct.toFixed(2)
+            });
+            pos.isClosing = true;
+            await cancelOrdersForTicker(pos.ticker);
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HARD_STOP', currentPrice);
+            if (result.success) {
+                journalTrade({
+                    action: 'HARD_STOP',
+                    tradeId: pos.tradeId,
+                    ticker: pos.ticker,
+                    entryPrice: pos.entryPrice,
+                    sellPrice: currentPrice,
+                    hardStopPrice,
+                    profitPct: profitPct.toFixed(2)
+                });
+                const summary = pt.closePosition(pos.ticker, currentPrice, 'HARD_STOP');
+                if (summary) {
+                    await notify(
+                        `HARD STOP: ${pos.ticker}\n` +
+                        `TradeID: ${summary.tradeId}\n` +
+                        `Entry $${summary.entryPrice.toFixed(2)} -> Stop $${hardStopPrice.toFixed(2)} -> Sold $${currentPrice.toFixed(2)}\n` +
+                        `P&L: $${summary.pnl.toFixed(2)}`,
+                        'loss'
+                    );
+                }
+            } else {
+                pos.isClosing = false;
+            }
+            continue;
+        }
+
+        const serverScale = decideServerScale(pos, profitPct);
+        if (serverScale) {
+            const preview = pt.previewScalePosition(pos.ticker, serverScale.sellPct, currentPrice);
+            if (preview && preview.sharesToSell > 0) {
+                const scaleResult = await placeSellOrder(
+                    pos.ticker,
+                    preview.sharesToSell,
+                    `Server scale ${serverScale.level} (${serverScale.sellPct}%)`,
+                    currentPrice
+                );
+
+                if (scaleResult.success) {
+                    pt.markMilestone(pos.ticker, serverScale.level);
+                    pt.scalePosition(pos.ticker, serverScale.sellPct, serverScale.level, currentPrice);
+                    log('FLOOR', `SERVER SCALE ${pos.ticker} ${serverScale.level}`, {
+                        tradeId: pos.tradeId,
+                        profitPct: profitPct.toFixed(2),
+                        sellPct: serverScale.sellPct
+                    });
+                }
+            }
+        }
+
+        const floorPct = calculateFloor(profitPct);
+        if (floorPct <= -999) continue;
+
+        const floorPrice = pos.entryPrice * (1 + floorPct / 100);
+        const currentStop = pos.currentStopPrice || 0;
+
+        if (currentPrice <= floorPrice && floorPct >= 0) {
+            log('FLOOR', `SERVER FLOOR BREACH: ${pos.ticker} price $${currentPrice.toFixed(2)} <= floor $${floorPrice.toFixed(2)}`, {
+                tradeId: pos.tradeId,
+                profitPct: profitPct.toFixed(2),
+                floorPct: floorPct.toFixed(2)
+            });
+            pos.isClosing = true;
+            await cancelOrdersForTicker(pos.ticker);
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'SERVER_FLOOR_BREACH', currentPrice);
+            if (result.success) {
+                journalTrade({
+                    action: 'SERVER_FLOOR_BREACH',
+                    tradeId: pos.tradeId,
+                    ticker: pos.ticker,
+                    entryPrice: pos.entryPrice,
+                    sellPrice: currentPrice,
+                    floorPrice,
+                    floorPct: floorPct.toFixed(2),
+                    profitPct: profitPct.toFixed(2)
+                });
+                const summary = pt.closePosition(pos.ticker, currentPrice, 'SERVER_FLOOR_BREACH');
+                if (summary) {
+                    await notify(
+                        `SERVER FLOOR BREACH: ${pos.ticker}\n` +
+                        `TradeID: ${summary.tradeId}\n` +
+                        `Price $${currentPrice.toFixed(2)} hit floor $${floorPrice.toFixed(2)}\n` +
+                        `P&L: $${summary.pnl.toFixed(2)} | Total: $${summary.totalPnL.toFixed(2)}`,
+                        summary.totalPnL >= 0 ? 'profit' : 'loss'
+                    );
+                }
+            } else {
+                pos.isClosing = false;
+            }
+            continue;
+        }
+
+        if (floorPrice > currentStop) {
+            log('FLOOR', `Virtual stop for ${pos.ticker}: $${currentStop.toFixed(2)} -> $${floorPrice.toFixed(2)}`, {
+                tradeId: pos.tradeId,
+                profitPct: profitPct.toFixed(2),
+                floorPct: floorPct.toFixed(2)
+            });
+            pt.updateStopPrice(pos.ticker, floorPrice, null);
+        }
+    }
+}
+
+function startPendingEntryMonitor(pt) {
+    if (pendingEntryTimer) clearInterval(pendingEntryTimer);
+    const intervalSecs = getPendingEntryCheckIntervalSecs();
+    pendingEntryTimer = setInterval(async () => {
+        await syncPendingEntries(pt);
+    }, intervalSecs * 1000);
+    log('INFO', `Pending-entry monitor started (${intervalSecs}s)`);
+}
+
 function startFloorMonitor(pt) {
     if (floorMonitorTimer) clearInterval(floorMonitorTimer);
-    const intervalSecs = parseInt(process.env.FLOOR_CHECK_INTERVAL_SECS || '5');
+    const intervalSecs = getFloorCheckIntervalSecs();
     floorMonitorTimer = setInterval(async () => {
-        await checkFloors(pt);
+        await checkManagedExits(pt);
     }, intervalSecs * 1000);
     log('INFO', `Floor monitor started (${intervalSecs}s)`);
 }
@@ -702,13 +998,14 @@ function startFloorMonitor(pt) {
 module.exports = {
     schwabService: {
         getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh,
-        isAuthenticated, getTokenStatus, placeBuyOrder, placeSellOrder,
+        isAuthenticated, getTokenStatus, placeBuyOrder: placeManagedBuyOrder, placeSellOrder,
         placeSellWithStop, placeStopOrder, cancelOrder, getOrderFillPrice,
-        getPositionsFromSchwab, getCurrentPrice, cancelOrdersForTicker,
+        getPositionsFromSchwab, getCurrentPrice, getCurrentPrices, cancelOrdersForTicker,
         getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId,
         isRegularHours, getSessionType,
         checkOrphanPositions, closeOrphanPositions, startOrphanCheck,
         checkHeartbeats, startHeartbeatCheck,
-        checkFloors, startFloorMonitor
+        checkFloors: checkManagedExits, startFloorMonitor,
+        syncPendingEntries, startPendingEntryMonitor
     }
 };

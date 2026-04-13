@@ -29,6 +29,20 @@ This file is the running record of repository analysis and updates for the curre
 - Added a root `.gitignore` to keep `node_modules/`, runtime logs, and local data out of Git tracking.
 - Clarified the intended architecture: Pine is the signal/visual layer and the server is the execution/fail-safe layer, so the server should not mirror Pine-only strategy rules.
 - Added route-level tests for the server-managed `SCALE` and `CLOSE` flows.
+- Investigated a real TradingView `401 Unauthorized` webhook incident for `JDZG` and traced it to invalid JSON number formatting in Pine alert payloads such as `.0` and `-.5`.
+- Fixed Pine webhook number formatting to use JSON-safe leading-zero masks and added a regression test to keep risky `"#."` alert formatting out of webhook payloads.
+- Hardened the server to parse `text/plain` webhook bodies as JSON when possible, preventing text/plain TradingView deliveries from being misreported as token failures.
+- Added route-level test coverage for plain-text JSON webhook delivery.
+- Investigated repeated after-hours `BUY+STOP` failures on Schwab for names such as `JDZG` and `GCTK` and confirmed the failing pattern was the composite entry-plus-stop order shape during `SEAMLESS` sessions.
+- Reworked server entry handling so live `BUY` requests now use plain entry orders, with extended-hours limit buys tracked as pending entries until Schwab account positions confirm a real fill.
+- Added a pending-entry monitor to the server startup flow so after-hours fills can be activated automatically without creating phantom local positions.
+- Shifted price-based risk handling to the server monitor:
+  - hard stop is now server-managed
+  - profit-floor ratcheting is now virtual/server-managed
+  - price-based scale milestones can be executed server-side
+- Rewrote the webhook route to support pending-entry cancellation on `CLOSE`, milestone-aware scale deduplication, and safer local state updates only after sell requests succeed.
+- Expanded tests to cover pending-entry lifecycle, server-managed scale deduplication, and pending-close cancellation.
+- Updated `env.example` and the architecture document to reflect the new pending-entry and server-managed protection model.
 
 ## Ongoing Rule For Future Sessions
 

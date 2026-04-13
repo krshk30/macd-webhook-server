@@ -50,3 +50,12 @@ test('heartbeat alert carries floor data used by server-side protection logic', 
         '"token":"'
     ]);
 });
+
+test('pine webhook alerts avoid risky decimal masks that can produce invalid JSON numbers', () => {
+    const alertLines = pineSource
+        .split('\n')
+        .filter(line => line.includes('alert('))
+        .join('\n');
+
+    assert.doesNotMatch(alertLines, /"#\./);
+});

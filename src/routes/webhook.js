@@ -1,33 +1,35 @@
 /**
- * Webhook Route v1.3.0
- * 
+ * Webhook Route v1.4.0
+ *
  * Changes:
- *   - Passes full webhook body to openPosition for journal logging
- *   - Trade ID included in all responses
- *   - Better error context in logs
+ *   - Plain BUY entries with pending-fill tracking for limit orders
+ *   - Server-managed scale protection; no child stop orchestration in the route
+ *   - Pending entries can be cancelled cleanly on CLOSE before fill
  */
 const express = require('express');
 const { schwabService } = require('../services/schwab');
 const { positions } = require('../services/positions');
 const { notify } = require('../services/notifications');
 const { log, getTradeId } = require('../services/logger');
+
 const router = express.Router();
 const DEFAULT_QTY = () => parseInt(process.env.DEFAULT_QUANTITY || '10');
 
 router.post('/webhook', async (req, res) => {
-    const t0 = Date.now(), body = req.body;
+    const t0 = Date.now();
+    const body = req.body;
 
-    // Guard: empty or non-JSON body
     if (!body || typeof body !== 'object') {
         log('WARN', 'Webhook received with empty/invalid body', {
-            ip: req.ip, contentType: req.headers['content-type'],
+            ip: req.ip,
+            contentType: req.headers['content-type'],
             rawBodyType: typeof body
         });
         return res.status(400).json({ error: 'invalid body' });
     }
 
     if (body.token !== process.env.WEBHOOK_TOKEN) {
-        log('WARN', `Unauthorized webhook attempt`, {
+        log('WARN', 'Unauthorized webhook attempt', {
             ip: req.ip,
             action: body.action,
             ticker: body.ticker,
@@ -38,6 +40,7 @@ router.post('/webhook', async (req, res) => {
         });
         return res.status(401).json({ error: 'unauthorized' });
     }
+
     if (!schwabService.isAuthenticated()) {
         log('ERROR', 'Webhook received but not authenticated');
         return res.status(503).json({ error: 'not_authenticated' });
@@ -46,13 +49,10 @@ router.post('/webhook', async (req, res) => {
     const { action, ticker, price } = body;
     if (!action || !ticker) return res.status(400).json({ error: 'missing action or ticker' });
 
-    // --- HEARTBEAT ---
     if (action === 'HEARTBEAT') {
         const pos = positions.getPosition(ticker);
         if (pos) {
             positions.touchPosition(ticker);
-            // v1.3.0: Stop ratcheting handled by floor monitor (5s interval)
-            // Heartbeat only proves Pine is still tracking this position
             return res.json({
                 status: 'heartbeat_ok',
                 ticker,
@@ -64,12 +64,21 @@ router.post('/webhook', async (req, res) => {
                 serverLatency: Date.now() - t0
             });
         }
+
+        if (positions.hasPendingEntry(ticker)) {
+            positions.touchPosition(ticker);
+            return res.json({ status: 'heartbeat_pending_entry', ticker });
+        }
+
         return res.json({ status: 'heartbeat_no_position', ticker });
     }
 
     const tradeId = getTradeId(ticker);
     log('WEBHOOK', `Received: ${action} ${ticker} @ $${price || '?'}`, {
-        tradeId, path: body.path, score: body.score, stochK: body.stochK
+        tradeId,
+        path: body.path,
+        score: body.score,
+        stochK: body.stochK
     });
 
     if (positions.isDuplicate(ticker, action)) {
@@ -79,64 +88,82 @@ router.post('/webhook', async (req, res) => {
     let result;
     try {
         switch (action) {
-            case 'BUY':   result = await handleBuy(ticker, price, body); break;
-            case 'SCALE': result = await handleScale(ticker, price, body); break;
-            case 'CLOSE': result = await handleClose(ticker, price, body); break;
-            default: return res.status(400).json({ error: `unknown: ${action}` });
+            case 'BUY':
+                result = await handleBuy(ticker, price, body);
+                break;
+            case 'SCALE':
+                result = await handleScale(ticker, price, body);
+                break;
+            case 'CLOSE':
+                result = await handleClose(ticker, price, body);
+                break;
+            default:
+                return res.status(400).json({ error: `unknown: ${action}` });
         }
     } catch (err) {
-        log('ERROR', `Webhook error: ${action} ${ticker}`, { error: err.message, tradeId });
+        log('ERROR', `Webhook error: ${action} ${ticker}`, {
+            error: err.message,
+            tradeId
+        });
         result = { success: false, error: err.message };
     }
 
-    log('WEBHOOK', `Completed: ${action} ${ticker} | ${Date.now() - t0}ms`, { tradeId });
-    res.json({ ...result, serverLatency: Date.now() - t0 });
+    log('WEBHOOK', `Completed: ${action} ${ticker} | ${Date.now() - t0}ms`, { tradeId: getTradeId(ticker) || tradeId });
+    return res.json({ ...result, serverLatency: Date.now() - t0 });
 });
 
 async function handleBuy(ticker, price, body) {
     const check = positions.canOpenPosition(ticker);
     if (!check.allowed) {
         log('REJECT', `BUY ${ticker}: ${check.reason}`, {
-            stochK: body.stochK, macd: body.macd, score: body.score
+            stochK: body.stochK,
+            macd: body.macd,
+            score: body.score
         });
         return { success: false, rejected: check.reason };
     }
 
     const qty = DEFAULT_QTY();
     const entryPrice = parseFloat(price) || 0;
-
-    // v1.3.0: Single TRIGGER order — BUY fills → child STOP activates
-    // No delay, no separate stop call, no race condition
     const result = await schwabService.placeBuyOrder(ticker, qty, entryPrice);
 
     if (result.success) {
-        positions.openPosition(ticker, entryPrice, qty, body);
-        // Record the stop price from the TRIGGER order
-        if (result.stopPrice) {
-            positions.setStopOrder(ticker, null, result.stopPrice);
+        if (result.needsFillConfirmation) {
+            positions.createPendingEntry(ticker, entryPrice, qty, result.orderId, body, {
+                session: result.session,
+                orderType: result.orderType
+            });
+        } else {
+            positions.openPosition(ticker, entryPrice, qty, body);
         }
     }
 
     const tradeId = getTradeId(ticker);
     return {
         success: result.success,
+        pending: !!result.needsFillConfirmation,
         action: 'BUY',
         tradeId,
         ticker,
         quantity: qty,
         signalPrice: entryPrice,
-        stopPrice: result.stopPrice || 0,
         orderId: result.orderId,
         schwabLatency: result.latency,
-        session: schwabService.getSessionType(),
+        session: result.session || schwabService.getSessionType(),
         path: body.path || 'unknown',
         score: body.score || null
     };
 }
 
 async function handleScale(ticker, price, body) {
+    await schwabService.syncPendingEntries(positions, ticker);
     const pos = positions.getPosition(ticker);
+
     if (!pos) {
+        if (positions.hasPendingEntry(ticker)) {
+            log('REJECT', `SCALE ${ticker}: pending entry not filled yet`);
+            return { success: false, rejected: 'pending entry not filled' };
+        }
         log('REJECT', `SCALE ${ticker}: no position`);
         return { success: false, rejected: 'no position' };
     }
@@ -145,68 +172,85 @@ async function handleScale(ticker, price, body) {
     const sellPct = parseInt(body.sell_pct) || 50;
     const currentPrice = parseFloat(price) || 0;
 
-    // Cancel existing stop BEFORE placing new TRIGGER order
-    const oldStopId = positions.getStopOrderId(ticker);
-    if (oldStopId) {
-        await schwabService.cancelOrder(oldStopId);
+    if (positions.isMilestoneHit(ticker, level)) {
+        log('DEDUP', `Ignoring already-hit scale ${ticker}:${level}`, { tradeId: pos.tradeId });
+        return {
+            success: true,
+            action: 'SCALE',
+            ignored: 'milestone_already_hit',
+            tradeId: pos.tradeId,
+            ticker,
+            level
+        };
     }
-    // Also cancel any other lingering orders
-    await schwabService.cancelOrdersForTicker(ticker);
 
-    positions.markMilestone(ticker, level);
-    const scaleResult = positions.scalePosition(ticker, sellPct, level, currentPrice);
-
-    if (!scaleResult || scaleResult.sharesToSell <= 0) {
+    const preview = positions.previewScalePosition(ticker, sellPct, currentPrice);
+    if (!preview || preview.sharesToSell <= 0) {
         log('WARN', `SCALE ${ticker}: nothing to sell`, {
-            tradeId: pos.tradeId, level, sellPct, remaining: pos.remainingQuantity
+            tradeId: pos.tradeId,
+            level,
+            sellPct,
+            remaining: pos.remainingQuantity
         });
-        // Re-place stop since we cancelled it
-        const currentStop = positions.getStopPrice(ticker);
-        if (currentStop > 0 && pos.remainingQuantity > 0) {
-            const stopResult = await schwabService.placeStopOrder(ticker, pos.remainingQuantity, currentStop);
-            if (stopResult.success) positions.updateStopPrice(ticker, currentStop, stopResult.orderId);
-        }
         return { success: false, rejected: 'nothing to sell' };
     }
 
-    const updatedPos = positions.getPosition(ticker);
-    const remaining = updatedPos ? updatedPos.remainingQuantity : 0;
-    const currentStop = positions.getStopPrice(ticker) || (pos.entryPrice - parseFloat(process.env.STOP_LOSS_CENTS || '0.02'));
-    let result;
+    const result = await schwabService.placeSellOrder(
+        ticker,
+        preview.sharesToSell,
+        `Scale ${level} (${sellPct}%)`,
+        currentPrice
+    );
 
-    if (remaining > 0) {
-        // v1.3.0: SELL+STOP TRIGGER — sell scale shares, child STOP for remaining
-        result = await schwabService.placeSellWithStop(
-            ticker, scaleResult.sharesToSell, remaining,
-            `Scale ${level} (${sellPct}%)`, currentPrice, currentStop
-        );
-        if (result.success) {
-            positions.updateStopPrice(ticker, currentStop, null);
-        }
-    } else {
-        // Selling everything — no child stop needed
-        result = await schwabService.placeSellOrder(
-            ticker, scaleResult.sharesToSell,
-            `Scale ${level} (${sellPct}%)`, currentPrice
-        );
+    if (!result.success) {
+        return {
+            success: false,
+            action: 'SCALE',
+            tradeId: pos.tradeId,
+            ticker,
+            level,
+            rejected: result.error || 'sell failed',
+            schwabLatency: result.latency
+        };
     }
 
+    positions.markMilestone(ticker, level);
+    const scaleResult = positions.scalePosition(ticker, sellPct, level, currentPrice);
+    const updatedPos = positions.getPosition(ticker);
+
     return {
-        success: result.success,
+        success: true,
         action: 'SCALE',
         tradeId: pos.tradeId,
-        ticker, level,
+        ticker,
+        level,
         sharesSold: scaleResult.sharesToSell,
-        remaining,
+        remaining: updatedPos ? updatedPos.remainingQuantity : 0,
         scalePnL: scaleResult.pnl.toFixed(2),
-        currentStop,
+        currentStop: positions.getStopPrice(ticker) || 0,
         schwabLatency: result.latency
     };
 }
 
 async function handleClose(ticker, price, body) {
+    await schwabService.syncPendingEntries(positions, ticker);
     const pos = positions.getPosition(ticker);
+
     if (!pos) {
+        const pending = positions.getPendingEntry(ticker);
+        if (pending) {
+            await schwabService.cancelOrder(pending.orderId);
+            await schwabService.cancelOrdersForTicker(ticker);
+            positions.clearPendingEntry(ticker, 'close_before_fill');
+            return {
+                success: true,
+                action: 'CLOSE',
+                ticker,
+                reason: body.reason || 'close_before_fill',
+                cancelledPending: true
+            };
+        }
+
         log('REJECT', `CLOSE ${ticker}: no position`);
         return { success: false, rejected: 'no position' };
     }
@@ -216,52 +260,60 @@ async function handleClose(ticker, price, body) {
 
     if (pos.remainingQuantity <= 0) {
         log('INFO', `CLOSE ${ticker}: fully scaled out`, { tradeId: pos.tradeId });
-        const s = positions.closePosition(ticker, exitPrice, 'all_scaled_out');
+        const summary = positions.closePosition(ticker, exitPrice, 'all_scaled_out');
         return {
-            success: true, action: 'CLOSE', tradeId: pos.tradeId,
-            ticker, reason: 'all_scaled_out', sharesClosed: 0,
-            pnl: s ? s.pnl.toFixed(2) : '0.00',
-            totalPnL: s ? s.totalPnL.toFixed(2) : '0.00'
+            success: true,
+            action: 'CLOSE',
+            tradeId: pos.tradeId,
+            ticker,
+            reason: 'all_scaled_out',
+            sharesClosed: 0,
+            pnl: summary ? summary.pnl.toFixed(2) : '0.00',
+            totalPnL: summary ? summary.totalPnL.toFixed(2) : '0.00'
         };
     }
 
-    // v1.3.0: Mark position as closing so heartbeat doesn't place new stops
     pos.isClosing = true;
-
-    // v1.3.0: Cancel the tracked stop order by ID first (fastest)
-    const stopId = positions.getStopOrderId(ticker);
-    if (stopId) {
-        await schwabService.cancelOrder(stopId);
-        log('STOP', `Cancelled stop ${stopId} before CLOSE`, { ticker });
-    }
-
-    // Also cancel any other open orders for this ticker
     await schwabService.cancelOrdersForTicker(ticker);
-
-    // Wait for cancellations to settle on Schwab's side
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(resolve => setTimeout(resolve, 500));
 
     const result = await schwabService.placeSellOrder(
-        ticker, pos.remainingQuantity,
-        `Close: ${reason}`, exitPrice
+        ticker,
+        pos.remainingQuantity,
+        `Close: ${reason}`,
+        exitPrice
     );
+
+    if (!result.success) {
+        pos.isClosing = false;
+        return {
+            success: false,
+            action: 'CLOSE',
+            tradeId: pos.tradeId,
+            ticker,
+            reason,
+            rejected: result.error || 'sell failed',
+            schwabLatency: result.latency
+        };
+    }
 
     const summary = positions.closePosition(ticker, exitPrice, reason);
 
     await notify(
         `CLOSED ${ticker}\n` +
         `TradeID: ${summary.tradeId}\n` +
-        `Entry: $${summary.entryPrice.toFixed(2)} → Exit: $${exitPrice.toFixed(2)}\n` +
+        `Entry: $${summary.entryPrice.toFixed(2)} -> Exit: $${exitPrice.toFixed(2)}\n` +
         `P&L: $${summary.pnl.toFixed(2)} (total: $${summary.totalPnL.toFixed(2)})\n` +
         `Hold: ${summary.holdMinutes}m | ${reason}`,
         summary.totalPnL >= 0 ? 'profit' : 'loss'
     );
 
     return {
-        success: result.success,
+        success: true,
         action: 'CLOSE',
         tradeId: summary.tradeId,
-        ticker, reason,
+        ticker,
+        reason,
         sharesClosed: summary.remainingClosed,
         pnl: summary.pnl.toFixed(2),
         totalPnL: summary.totalPnL.toFixed(2),
