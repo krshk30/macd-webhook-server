@@ -43,6 +43,17 @@ This file is the running record of repository analysis and updates for the curre
 - Rewrote the webhook route to support pending-entry cancellation on `CLOSE`, milestone-aware scale deduplication, and safer local state updates only after sell requests succeed.
 - Expanded tests to cover pending-entry lifecycle, server-managed scale deduplication, and pending-close cancellation.
 - Updated `env.example` and the architecture document to reflect the new pending-entry and server-managed protection model.
+- Investigated a production `RMSG` incident where a filled extended-hours entry stayed marked as pending, so the hard-stop/floor monitor never watched it and a later `CLOSE` cleared the pending record instead of selling the live shares.
+- Confirmed the failure path from logs:
+  - `BUY` created a pending entry
+  - no activation happened before `CLOSE`
+  - `cancelOrder` returned `400`, consistent with an already-filled order
+  - the route still cleared the pending record
+- Hotfixed pending-entry promotion to check the Schwab order details endpoint for fills, not just account positions.
+- Hotfixed `CLOSE` so a pending entry is re-checked for fill status before it is ever cleared, including a retry path after cancel failure.
+- Added regression tests for:
+  - filled pending entry closes correctly
+  - cancel failure triggers order-detail re-check before clearing
 
 ## Ongoing Rule For Future Sessions
 

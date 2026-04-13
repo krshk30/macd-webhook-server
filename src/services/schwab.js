@@ -141,6 +141,7 @@ async function getPositionsFromSchwab() {
     try {
         const r = await axios.get(`${SCHWAB_API_BASE}/accounts`, {
             headers: { 'Authorization': `Bearer ${tokens.access_token}`, 'Accept': 'application/json' },
+            params: { fields: 'positions' },
             httpsAgent: keepAliveAgent, timeout: 10000
         });
         const acct = (r.data || []).find(a => a.securitiesAccount) || r.data?.[0] || {};
@@ -728,6 +729,41 @@ async function checkFloors(pt) {
     }
 }
 
+async function getOrderDetails(orderId) {
+    if (!orderId) return null;
+    try {
+        const r = await api.get(`/accounts/${getAccountId()}/orders/${orderId}`);
+        const order = r.data || {};
+        const activities = order.orderActivityCollection || [];
+        let filledQuantity = 0;
+        let filledNotional = 0;
+
+        for (const act of activities) {
+            const legs = act?.executionLegs || [];
+            for (const leg of legs) {
+                const qty = Number(leg.quantity || 0);
+                const px = Number(leg.price || 0);
+                if (qty > 0) {
+                    filledQuantity += qty;
+                    filledNotional += qty * px;
+                }
+            }
+        }
+
+        return {
+            status: order.status || 'UNKNOWN',
+            filledQuantity,
+            averageFillPrice: filledQuantity > 0 ? filledNotional / filledQuantity : 0,
+            order
+        };
+    } catch (e) {
+        log('WARN', `Could not get order details for ${orderId}`, {
+            error: e.response?.status || e.message
+        });
+        return null;
+    }
+}
+
 async function placeManagedBuyOrder(ticker, quantity, price) {
     const t0 = Date.now();
     const session = getSessionType();
@@ -798,6 +834,28 @@ async function syncPendingEntries(pt, ticker = null) {
     const now = Date.now();
 
     for (const pending of pendingEntries) {
+        const orderDetails = await getOrderDetails(pending.orderId);
+        if (orderDetails?.filledQuantity > 0) {
+            const pos = pt.activatePendingEntry(
+                pending.ticker,
+                orderDetails.averageFillPrice || pending.signalPrice || 0,
+                orderDetails.filledQuantity,
+                {
+                    source: 'order_details'
+                }
+            );
+            if (pos) {
+                activated.push(pos);
+                await notify(
+                    `ENTRY CONFIRMED ${pending.ticker}\n` +
+                    `TradeID: ${pos.tradeId}\n` +
+                    `Qty: ${orderDetails.filledQuantity} @ $${(orderDetails.averageFillPrice || pending.signalPrice || 0).toFixed(2)}`,
+                    'buy'
+                );
+            }
+            continue;
+        }
+
         const brokerPos = findBrokerPosition(brokerPositions, pending.ticker);
         if (brokerPos) {
             const quantity = brokerPos.longQuantity || pending.requestedQuantity || 0;
@@ -822,6 +880,7 @@ async function syncPendingEntries(pt, ticker = null) {
             log('WARN', `Pending entry still unfilled: ${pending.ticker}`, {
                 tradeId: pending.tradeId,
                 orderId: pending.orderId,
+                status: orderDetails?.status || 'UNKNOWN',
                 ageSecs
             });
         }
@@ -999,7 +1058,7 @@ module.exports = {
     schwabService: {
         getAuthUrl, exchangeCodeForTokens, refreshAccessToken, startTokenRefresh,
         isAuthenticated, getTokenStatus, placeBuyOrder: placeManagedBuyOrder, placeSellOrder,
-        placeSellWithStop, placeStopOrder, cancelOrder, getOrderFillPrice,
+        placeSellWithStop, placeStopOrder, cancelOrder, getOrderFillPrice, getOrderDetails,
         getPositionsFromSchwab, getCurrentPrice, getCurrentPrices, cancelOrdersForTicker,
         getAccessToken, setAccountHash, getAccountHash, fetchAccountHash, getAccountId,
         isRegularHours, getSessionType,

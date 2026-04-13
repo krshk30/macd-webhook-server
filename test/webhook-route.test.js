@@ -47,6 +47,7 @@ function buildWebhookApp(overrides = {}) {
                 state.cancelCalls.push(['cancelOrdersForTicker', ...args]);
                 return 0;
             },
+            getOrderDetails: async () => null,
             syncPendingEntries: async (...args) => {
                 state.syncCalls.push(args);
                 return [];
@@ -401,6 +402,140 @@ test('close request cancels a pending entry before fill', async () => {
             ['cancelOrdersForTicker', 'AAPL']
         ]);
         assert.deepEqual(state.pendingCleared[0], ['AAPL', 'close_before_fill']);
+    });
+});
+
+test('close request promotes a filled pending entry and sells it instead of clearing it', async () => {
+    process.env.WEBHOOK_TOKEN = 'secret';
+
+    const pending = {
+        orderId: 'OID-PENDING',
+        signalPrice: 100.1
+    };
+    const livePosition = {
+        tradeId: 'T-AAPL',
+        entryPrice: 100.15,
+        remainingQuantity: 10,
+        isClosing: false
+    };
+    let activated = false;
+
+    const { app, state } = buildWebhookApp({
+        schwabService: {
+            getOrderDetails: async () => ({
+                status: 'FILLED',
+                filledQuantity: 10,
+                averageFillPrice: 100.15
+            })
+        },
+        positions: {
+            getPosition: () => (activated ? livePosition : null),
+            getPendingEntry: () => pending,
+            activatePendingEntry: () => {
+                activated = true;
+                return livePosition;
+            },
+            closePosition: () => ({
+                tradeId: 'T-AAPL',
+                entryPrice: 100.15,
+                pnl: -3,
+                totalPnL: -3,
+                holdMinutes: '1.0',
+                remainingClosed: 10
+            })
+        }
+    });
+
+    await withServer(app, async baseUrl => {
+        const response = await fetch(`${baseUrl}/webhook`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                action: 'CLOSE',
+                ticker: 'AAPL',
+                token: 'secret',
+                price: 99.85,
+                reason: 'MACD_BEAR'
+            })
+        });
+
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.success, true);
+        assert.equal(body.sharesClosed, 10);
+        assert.equal(state.pendingCleared.length, 0);
+        assert.deepEqual(state.sellCalls[0], ['AAPL', 10, 'Close: MACD_BEAR', 99.85]);
+    });
+});
+
+test('close request re-checks order details after cancel failure before clearing pending entry', async () => {
+    process.env.WEBHOOK_TOKEN = 'secret';
+
+    const pending = {
+        orderId: 'OID-PENDING',
+        signalPrice: 100.1
+    };
+    const livePosition = {
+        tradeId: 'T-AAPL',
+        entryPrice: 100.2,
+        remainingQuantity: 8,
+        isClosing: false
+    };
+    let activated = false;
+    let detailCallCount = 0;
+
+    const { app, state } = buildWebhookApp({
+        schwabService: {
+            cancelOrder: async (...args) => {
+                state.cancelCalls.push(['cancelOrder', ...args]);
+                return false;
+            },
+            getOrderDetails: async () => {
+                detailCallCount += 1;
+                if (detailCallCount === 1) return null;
+                return {
+                    status: 'FILLED',
+                    filledQuantity: 8,
+                    averageFillPrice: 100.2
+                };
+            }
+        },
+        positions: {
+            getPosition: () => (activated ? livePosition : null),
+            getPendingEntry: () => pending,
+            activatePendingEntry: () => {
+                activated = true;
+                return livePosition;
+            },
+            closePosition: () => ({
+                tradeId: 'T-AAPL',
+                entryPrice: 100.2,
+                pnl: -4,
+                totalPnL: -4,
+                holdMinutes: '1.0',
+                remainingClosed: 8
+            })
+        }
+    });
+
+    await withServer(app, async baseUrl => {
+        const response = await fetch(`${baseUrl}/webhook`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                action: 'CLOSE',
+                ticker: 'AAPL',
+                token: 'secret',
+                price: 99.7,
+                reason: 'MACD_BEAR'
+            })
+        });
+
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.success, true);
+        assert.equal(state.pendingCleared.length, 0);
+        assert.deepEqual(state.sellCalls[0], ['AAPL', 8, 'Close: MACD_BEAR', 99.7]);
     });
 });
 

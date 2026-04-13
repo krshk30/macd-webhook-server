@@ -234,23 +234,51 @@ async function handleScale(ticker, price, body) {
 
 async function handleClose(ticker, price, body) {
     await schwabService.syncPendingEntries(positions, ticker);
-    const pos = positions.getPosition(ticker);
+    let pos = positions.getPosition(ticker);
 
     if (!pos) {
         const pending = positions.getPendingEntry(ticker);
         if (pending) {
-            await schwabService.cancelOrder(pending.orderId);
-            await schwabService.cancelOrdersForTicker(ticker);
-            positions.clearPendingEntry(ticker, 'close_before_fill');
-            return {
-                success: true,
-                action: 'CLOSE',
-                ticker,
-                reason: body.reason || 'close_before_fill',
-                cancelledPending: true
-            };
-        }
+            const orderDetails = await schwabService.getOrderDetails(pending.orderId);
+            if (orderDetails?.filledQuantity > 0) {
+                positions.activatePendingEntry(
+                    ticker,
+                    orderDetails.averageFillPrice || pending.signalPrice || 0,
+                    orderDetails.filledQuantity,
+                    { source: 'close_order_details' }
+                );
+                pos = positions.getPosition(ticker);
+            } else {
+                const cancelled = await schwabService.cancelOrder(pending.orderId);
+                if (!cancelled) {
+                    const retryOrderDetails = await schwabService.getOrderDetails(pending.orderId);
+                    if (retryOrderDetails?.filledQuantity > 0) {
+                        positions.activatePendingEntry(
+                            ticker,
+                            retryOrderDetails.averageFillPrice || pending.signalPrice || 0,
+                            retryOrderDetails.filledQuantity,
+                            { source: 'close_cancel_retry' }
+                        );
+                        pos = positions.getPosition(ticker);
+                    }
+                }
 
+                if (!pos) {
+                    await schwabService.cancelOrdersForTicker(ticker);
+                    positions.clearPendingEntry(ticker, 'close_before_fill');
+                    return {
+                        success: true,
+                        action: 'CLOSE',
+                        ticker,
+                        reason: body.reason || 'close_before_fill',
+                        cancelledPending: true
+                    };
+                }
+            }
+        }
+    }
+
+    if (!pos) {
         log('REJECT', `CLOSE ${ticker}: no position`);
         return { success: false, rejected: 'no position' };
     }
