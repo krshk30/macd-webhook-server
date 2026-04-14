@@ -94,7 +94,7 @@ test('pending entries block duplicate buys and can be activated on fill', () => 
     const live = positions.getPosition('AAPL');
     assert.ok(live);
     assert.equal(live.remainingQuantity, 10);
-    assert.equal(live.currentStopPrice, 100.58);
+    assert.equal(live.currentStopPrice, 99.59);
 });
 
 test('preview scale does not mutate state before an order is confirmed', () => {
@@ -110,4 +110,19 @@ test('preview scale does not mutate state before an order is confirmed', () => {
     positions.markMilestone('AAPL', 'PCT2');
     assert.equal(positions.isMilestoneHit('AAPL', 'PCT2'), true);
     assert.equal(positions.isMilestoneHit('AAPL', 'FAST4'), false);
+});
+
+test('initial hard stop scales with price but still respects a one-cent minimum', () => {
+    const positions = loadPositionsModule();
+
+    positions.openPosition('CHEAP', 0.64, 10, {});
+    positions.openPosition('MID', 6.9153, 10, {});
+
+    const cheap = positions.getPosition('CHEAP');
+    const mid = positions.getPosition('MID');
+
+    assert.ok(cheap);
+    assert.ok(mid);
+    assert.equal(cheap.currentStopPrice, 0.63);
+    assert.equal(mid.currentStopPrice, 6.85);
 });

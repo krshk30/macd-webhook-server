@@ -39,6 +39,12 @@ function getLimitBuffer() { return parseFloat(process.env.LIMIT_BUFFER_CENTS || 
 function getFloorCheckIntervalSecs() { return parseInt(process.env.FLOOR_CHECK_INTERVAL_SECS || '5'); }
 function getPendingEntryCheckIntervalSecs() { return parseInt(process.env.PENDING_ENTRY_CHECK_INTERVAL_SECS || '2'); }
 function getPendingEntryTimeoutSecs() { return parseInt(process.env.PENDING_ENTRY_TIMEOUT_SECS || '120'); }
+function getHardStopDistance(entryPrice) {
+    const stopPct = parseFloat(process.env.HARD_STOP_PCT || '0.01');
+    const minCents = parseFloat(process.env.HARD_STOP_MIN_CENTS || '0.01');
+    if (entryPrice <= 0) return minCents;
+    return Math.max(minCents, parseFloat((entryPrice * stopPct).toFixed(2)));
+}
 function isServerManagedScalesEnabled() { return process.env.SERVER_MANAGED_SCALES !== 'false'; }
 function isBrokerOrphanImportEnabled() { return process.env.ENABLE_BROKER_ORPHAN_IMPORT === 'true'; }
 function getOrderType(req, price) {
@@ -232,8 +238,8 @@ async function placeBuyOrder(ticker, quantity, price) {
     const t0 = Date.now(), session = getSessionType();
     const buyOrderType = getOrderType('MARKET', price);
     const buffer = getLimitBuffer();
-    const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
-    const stopPrice = parseFloat((price - stopCents).toFixed(2));
+    const stopDistance = getHardStopDistance(price);
+    const stopPrice = parseFloat((price - stopDistance).toFixed(2));
 
     // Child STOP order — activates after BUY fills
     const childStop = {
@@ -661,13 +667,16 @@ async function checkFloors(pt) {
         const floorState = getActiveFloorState(pos, profitPct);
         const { floorPct, computedFloorPrice, activeFloorPrice, currentStop } = floorState;
 
-        // HARD STOP: if price dropped below entry - STOP_LOSS_CENTS, sell immediately
+        // HARD STOP: close if price drops below the configured entry-based stop distance
         // This catches the case where the TRIGGER's child STOP was rejected
-        const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
-        const hardStopPrice = pos.entryPrice - stopCents;
+        const hardStopDistance = getHardStopDistance(pos.entryPrice);
+        const hardStopPrice = parseFloat((pos.entryPrice - hardStopDistance).toFixed(2));
         if (currentPrice <= hardStopPrice) {
             log('FLOOR', `🛑 HARD STOP: ${pos.ticker} price $${currentPrice.toFixed(2)} <= stop $${hardStopPrice.toFixed(2)}`, {
-                tradeId: pos.tradeId, entryPrice: pos.entryPrice, profitPct: profitPct.toFixed(2)
+                tradeId: pos.tradeId,
+                entryPrice: pos.entryPrice,
+                profitPct: profitPct.toFixed(2),
+                stopDistance: hardStopDistance.toFixed(2)
             });
             pos.isClosing = true;
             await cancelOrdersForTicker(pos.ticker);
@@ -942,20 +951,20 @@ async function checkManagedExits(pt) {
     if (allPositions.length === 0) return;
 
     const prices = await getCurrentPrices(allPositions.map(pos => pos.ticker));
-    const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
-
     for (const pos of allPositions) {
         const currentPrice = prices[pos.ticker] || 0;
         if (currentPrice <= 0) continue;
 
         const profitPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
-        const hardStopPrice = pos.entryPrice - stopCents;
+        const hardStopDistance = getHardStopDistance(pos.entryPrice);
+        const hardStopPrice = parseFloat((pos.entryPrice - hardStopDistance).toFixed(2));
 
         if (currentPrice <= hardStopPrice) {
             log('FLOOR', `HARD STOP: ${pos.ticker} price $${currentPrice.toFixed(2)} <= stop $${hardStopPrice.toFixed(2)}`, {
                 tradeId: pos.tradeId,
                 entryPrice: pos.entryPrice,
-                profitPct: profitPct.toFixed(2)
+                profitPct: profitPct.toFixed(2),
+                stopDistance: hardStopDistance.toFixed(2)
             });
             pos.isClosing = true;
             await cancelOrdersForTicker(pos.ticker);
@@ -1096,7 +1105,8 @@ module.exports = {
         syncPendingEntries, startPendingEntryMonitor,
         __test: {
             calculateFloor,
-            getActiveFloorState
+            getActiveFloorState,
+            getHardStopDistance
         }
     }
 };

@@ -71,6 +71,7 @@ This file is the running record of repository analysis and updates for the curre
   - this diverged from Pine's peak-based sticky floor behavior
 - Fixed server floor monitoring so breach checks now use the sticky ratcheted stop as the active floor threshold and never loosen on pullbacks.
 - Added `test/schwab-floor.test.js` to lock in the sticky-floor behavior with regression coverage for the `BTBD`-style pullback case.
+- Replaced the old fixed `2¢` hard stop with a price-scaled `1%` hard stop plus a `1¢` minimum floor so higher-priced names such as `ROLR` are not stopped out by sub-0.3% pullbacks.
 
 ## Ongoing Rule For Future Sessions
 

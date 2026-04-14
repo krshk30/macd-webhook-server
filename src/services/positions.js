@@ -29,8 +29,16 @@ const recentAlerts = new Map();
 const DEDUP_WINDOW_MS = parseInt(process.env.DEDUP_WINDOW_MS || '5000');
 
 function getInitialHardStop(entryPrice) {
-    const stopCents = parseFloat(process.env.STOP_LOSS_CENTS || '0.02');
-    return entryPrice > 0 ? parseFloat((entryPrice - stopCents).toFixed(2)) : 0;
+    const stopPct = parseFloat(process.env.HARD_STOP_PCT || '0.01');
+    const minCents = parseFloat(process.env.HARD_STOP_MIN_CENTS || '0.01');
+    if (entryPrice <= 0) return 0;
+
+    const stopDistance = Math.max(
+        minCents,
+        parseFloat((entryPrice * stopPct).toFixed(2))
+    );
+
+    return parseFloat((entryPrice - stopDistance).toFixed(2));
 }
 
 function buildEntryData(webhookData = {}) {
