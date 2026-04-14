@@ -40,6 +40,7 @@ function getFloorCheckIntervalSecs() { return parseInt(process.env.FLOOR_CHECK_I
 function getPendingEntryCheckIntervalSecs() { return parseInt(process.env.PENDING_ENTRY_CHECK_INTERVAL_SECS || '2'); }
 function getPendingEntryTimeoutSecs() { return parseInt(process.env.PENDING_ENTRY_TIMEOUT_SECS || '120'); }
 function isServerManagedScalesEnabled() { return process.env.SERVER_MANAGED_SCALES !== 'false'; }
+function isBrokerOrphanImportEnabled() { return process.env.ENABLE_BROKER_ORPHAN_IMPORT === 'true'; }
 function getOrderType(req, price) {
     if (isRegularHours()) return req;
     if (req === 'MARKET' && price > 0) { log('ORDER', 'Ext hours: MARKET → LIMIT'); return 'LIMIT'; }
@@ -497,6 +498,7 @@ async function cancelOrdersForTicker(ticker) {
 }
 
 async function checkOrphanPositions(pt) {
+    if (!isBrokerOrphanImportEnabled()) return;
     if (!isAuthenticated() || !accountHash) return;
     try {
         const schwab = await getPositionsFromSchwab();
@@ -515,6 +517,7 @@ async function checkOrphanPositions(pt) {
 }
 
 async function closeOrphanPositions(pt) {
+    if (!isBrokerOrphanImportEnabled()) return;
     if (!isAuthenticated()) return;
     for (const o of pt.getOrphans(parseInt(process.env.ORPHAN_TIMEOUT_MINS || '5'))) {
         log('WARN', `Auto-closing orphan: ${o.ticker} x${o.remainingQuantity}`, { tradeId: o.tradeId });
@@ -588,7 +591,7 @@ function startOrphanCheck(pt) {
         await checkOrphanPositions(pt);
         await closeOrphanPositions(pt);
     }, 60 * 1000);
-    log('INFO', 'Orphan checker started (1 min)');
+    log('INFO', `Orphan checker started (1 min, broker import: ${isBrokerOrphanImportEnabled() ? 'enabled' : 'disabled'})`);
 }
 
 function startHeartbeatCheck(pt) {

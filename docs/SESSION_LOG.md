@@ -54,6 +54,8 @@ This file is the running record of repository analysis and updates for the curre
 - Added regression tests for:
   - filled pending entry closes correctly
   - cancel failure triggers order-detail re-check before clearing
+- Investigated a second production safety issue where the orphan checker imported unrelated manual Thinkorswim positions and later auto-closed them as `ORPHAN_AUTO_CLOSE`.
+- Locked broker orphan import behind a new env flag `ENABLE_BROKER_ORPHAN_IMPORT`, defaulting to `false`, so the server now only manages positions it created or restored from its own persisted state unless broker import is explicitly enabled.
 
 ## Ongoing Rule For Future Sessions
 
