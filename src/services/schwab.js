@@ -621,6 +621,29 @@ function calculateFloor(profitPct) {
     return -999; // no floor yet
 }
 
+function getActiveFloorState(pos, profitPct) {
+    const floorPct = calculateFloor(profitPct);
+    const currentStop = pos.currentStopPrice || 0;
+    if (floorPct <= -999) {
+        return {
+            floorPct,
+            computedFloorPrice: 0,
+            activeFloorPrice: currentStop,
+            currentStop
+        };
+    }
+
+    const computedFloorPrice = parseFloat((pos.entryPrice * (1 + floorPct / 100)).toFixed(2));
+    const activeFloorPrice = parseFloat(Math.max(computedFloorPrice, currentStop).toFixed(2));
+
+    return {
+        floorPct,
+        computedFloorPrice,
+        activeFloorPrice,
+        currentStop
+    };
+}
+
 async function checkFloors(pt) {
     if (!isAuthenticated()) return;
     const allPositions = pt.getAllPositions();
@@ -635,7 +658,8 @@ async function checkFloors(pt) {
         if (currentPrice <= 0) continue;
 
         const profitPct = (currentPrice - pos.entryPrice) / pos.entryPrice * 100;
-        const floorPct = calculateFloor(profitPct);
+        const floorState = getActiveFloorState(pos, profitPct);
+        const { floorPct, computedFloorPrice, activeFloorPrice, currentStop } = floorState;
 
         // HARD STOP: if price dropped below entry - STOP_LOSS_CENTS, sell immediately
         // This catches the case where the TRIGGER's child STOP was rejected
@@ -676,13 +700,14 @@ async function checkFloors(pt) {
         // No floor active yet (profit below 1%) — skip floor logic but hard stop above already covers
         if (floorPct <= -999) continue;
 
-        const floorPrice = pos.entryPrice * (1 + floorPct / 100);
-        const currentStop = pos.currentStopPrice || 0;
-
         // Check if price breached the floor — emergency sell
-        if (currentPrice <= floorPrice && floorPct >= 0) {
-            log('FLOOR', `🚨 FLOOR BREACH (server): ${pos.ticker} price $${currentPrice.toFixed(2)} <= floor $${floorPrice.toFixed(2)}`, {
-                tradeId: pos.tradeId, profitPct: profitPct.toFixed(2), floorPct: floorPct.toFixed(2)
+        if (currentPrice <= activeFloorPrice && floorPct >= 0) {
+            log('FLOOR', `🚨 FLOOR BREACH (server): ${pos.ticker} price $${currentPrice.toFixed(2)} <= sticky floor $${activeFloorPrice.toFixed(2)}`, {
+                tradeId: pos.tradeId,
+                profitPct: profitPct.toFixed(2),
+                floorPct: floorPct.toFixed(2),
+                computedFloorPrice: computedFloorPrice.toFixed(2),
+                currentStop: currentStop.toFixed(2)
             });
             pos.isClosing = true;
             if (pos.stopOrderId) {
@@ -698,7 +723,7 @@ async function checkFloors(pt) {
                     ticker: pos.ticker,
                     entryPrice: pos.entryPrice,
                     sellPrice: currentPrice,
-                    floorPrice,
+                    floorPrice: activeFloorPrice,
                     floorPct: floorPct.toFixed(2),
                     profitPct: profitPct.toFixed(2)
                 });
@@ -707,7 +732,7 @@ async function checkFloors(pt) {
                     await notify(
                         `🚨 SERVER FLOOR BREACH: ${pos.ticker}\n` +
                         `TradeID: ${summary.tradeId}\n` +
-                        `Price $${currentPrice.toFixed(2)} hit floor $${floorPrice.toFixed(2)}\n` +
+                        `Price $${currentPrice.toFixed(2)} hit floor $${activeFloorPrice.toFixed(2)}\n` +
                         `P&L: $${summary.pnl.toFixed(2)} | Total: $${summary.totalPnL.toFixed(2)}`,
                         summary.totalPnL >= 0 ? 'profit' : 'loss'
                     );
@@ -717,16 +742,16 @@ async function checkFloors(pt) {
         }
 
         // Ratchet stop up if floor increased
-        if (floorPrice > currentStop) {
-            log('FLOOR', `Ratcheting stop for ${pos.ticker}: $${currentStop.toFixed(2)} → $${floorPrice.toFixed(2)}`, {
+        if (computedFloorPrice > currentStop) {
+            log('FLOOR', `Ratcheting stop for ${pos.ticker}: $${currentStop.toFixed(2)} → $${computedFloorPrice.toFixed(2)}`, {
                 tradeId: pos.tradeId, profitPct: profitPct.toFixed(2), floorPct: floorPct.toFixed(2)
             });
             if (pos.stopOrderId) {
                 await cancelOrder(pos.stopOrderId);
             }
-            const stopResult = await placeStopOrder(pos.ticker, pos.remainingQuantity, floorPrice);
+            const stopResult = await placeStopOrder(pos.ticker, pos.remainingQuantity, computedFloorPrice);
             if (stopResult.success) {
-                pt.updateStopPrice(pos.ticker, floorPrice, stopResult.orderId);
+                pt.updateStopPrice(pos.ticker, computedFloorPrice, stopResult.orderId);
             }
         }
     }
@@ -985,17 +1010,17 @@ async function checkManagedExits(pt) {
             }
         }
 
-        const floorPct = calculateFloor(profitPct);
+        const floorState = getActiveFloorState(pos, profitPct);
+        const { floorPct, computedFloorPrice, activeFloorPrice, currentStop } = floorState;
         if (floorPct <= -999) continue;
 
-        const floorPrice = pos.entryPrice * (1 + floorPct / 100);
-        const currentStop = pos.currentStopPrice || 0;
-
-        if (currentPrice <= floorPrice && floorPct >= 0) {
-            log('FLOOR', `SERVER FLOOR BREACH: ${pos.ticker} price $${currentPrice.toFixed(2)} <= floor $${floorPrice.toFixed(2)}`, {
+        if (currentPrice <= activeFloorPrice && floorPct >= 0) {
+            log('FLOOR', `SERVER FLOOR BREACH: ${pos.ticker} price $${currentPrice.toFixed(2)} <= sticky floor $${activeFloorPrice.toFixed(2)}`, {
                 tradeId: pos.tradeId,
                 profitPct: profitPct.toFixed(2),
-                floorPct: floorPct.toFixed(2)
+                floorPct: floorPct.toFixed(2),
+                computedFloorPrice: computedFloorPrice.toFixed(2),
+                currentStop: currentStop.toFixed(2)
             });
             pos.isClosing = true;
             await cancelOrdersForTicker(pos.ticker);
@@ -1008,7 +1033,7 @@ async function checkManagedExits(pt) {
                     ticker: pos.ticker,
                     entryPrice: pos.entryPrice,
                     sellPrice: currentPrice,
-                    floorPrice,
+                    floorPrice: activeFloorPrice,
                     floorPct: floorPct.toFixed(2),
                     profitPct: profitPct.toFixed(2)
                 });
@@ -1017,7 +1042,7 @@ async function checkManagedExits(pt) {
                     await notify(
                         `SERVER FLOOR BREACH: ${pos.ticker}\n` +
                         `TradeID: ${summary.tradeId}\n` +
-                        `Price $${currentPrice.toFixed(2)} hit floor $${floorPrice.toFixed(2)}\n` +
+                        `Price $${currentPrice.toFixed(2)} hit floor $${activeFloorPrice.toFixed(2)}\n` +
                         `P&L: $${summary.pnl.toFixed(2)} | Total: $${summary.totalPnL.toFixed(2)}`,
                         summary.totalPnL >= 0 ? 'profit' : 'loss'
                     );
@@ -1028,13 +1053,13 @@ async function checkManagedExits(pt) {
             continue;
         }
 
-        if (floorPrice > currentStop) {
-            log('FLOOR', `Virtual stop for ${pos.ticker}: $${currentStop.toFixed(2)} -> $${floorPrice.toFixed(2)}`, {
+        if (computedFloorPrice > currentStop) {
+            log('FLOOR', `Virtual stop for ${pos.ticker}: $${currentStop.toFixed(2)} -> $${computedFloorPrice.toFixed(2)}`, {
                 tradeId: pos.tradeId,
                 profitPct: profitPct.toFixed(2),
                 floorPct: floorPct.toFixed(2)
             });
-            pt.updateStopPrice(pos.ticker, floorPrice, null);
+            pt.updateStopPrice(pos.ticker, computedFloorPrice, null);
         }
     }
 }
@@ -1068,6 +1093,10 @@ module.exports = {
         checkOrphanPositions, closeOrphanPositions, startOrphanCheck,
         checkHeartbeats, startHeartbeatCheck,
         checkFloors: checkManagedExits, startFloorMonitor,
-        syncPendingEntries, startPendingEntryMonitor
+        syncPendingEntries, startPendingEntryMonitor,
+        __test: {
+            calculateFloor,
+            getActiveFloorState
+        }
     }
 };

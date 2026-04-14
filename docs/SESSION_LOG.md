@@ -57,6 +57,21 @@ This file is the running record of repository analysis and updates for the curre
 - Investigated a second production safety issue where the orphan checker imported unrelated manual Thinkorswim positions and later auto-closed them as `ORPHAN_AUTO_CLOSE`.
 - Locked broker orphan import behind a new env flag `ENABLE_BROKER_ORPHAN_IMPORT`, defaulting to `false`, so the server now only manages positions it created or restored from its own persisted state unless broker import is explicitly enabled.
 
+## 2026-04-14
+
+- Reconstructed the full `BTBD` trade from Railway logs and TradingView alert screenshots:
+  - entry `10 @ 1.9797`
+  - server-managed `PCT2` scale sold `5`
+  - server-managed `PCT4_AFTER2` scale sold `2`
+  - final `3` shares were closed by `HEARTBEAT_EXPIRED`
+- Confirmed TradingView's attempted `FLOOR_BREACH` close for `BTBD` still used malformed numeric JSON (`stochK:.0`), which means the TradingView site was likely running an older Pine copy instead of the JSON-safe repo version.
+- Identified a real server-side floor mismatch:
+  - the server ratcheted `currentStopPrice` upward
+  - but floor breach checks still recalculated floor from current profit, allowing the effective floor to loosen on pullbacks
+  - this diverged from Pine's peak-based sticky floor behavior
+- Fixed server floor monitoring so breach checks now use the sticky ratcheted stop as the active floor threshold and never loosen on pullbacks.
+- Added `test/schwab-floor.test.js` to lock in the sticky-floor behavior with regression coverage for the `BTBD`-style pullback case.
+
 ## Ongoing Rule For Future Sessions
 
 - Record meaningful analysis, file updates, and architecture decisions here whenever changes are made.
