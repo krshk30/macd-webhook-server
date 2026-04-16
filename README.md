@@ -10,7 +10,9 @@ This repository is the execution backend for a MACD momentum workflow. TradingVi
 - Current version in code: `v1.3.0`
 - Hosting target: Railway
 - Broker integration: Schwab Trader API
-- TradingView Pine script: `tradingview/macd-momentum-alerts-v3.4.2_1.pine`
+- TradingView Pine pair:
+  - `tradingview/multi-path-momentum-scalp-v1.0-indicator.pine`
+  - `tradingview/multi-path-momentum-scalp-v1.0-strategy.pine`
 
 ## What The Server Does
 
@@ -197,7 +199,10 @@ Use `env.example` as the starting point.
 | `ORPHAN_TIMEOUT_MINS` | No | Minutes before orphan auto-close |
 | `HEARTBEAT_TIMEOUT_SECS` | No | Seconds before heartbeat expiry |
 | `LIMIT_BUFFER_CENTS` | No | Buffer used for extended-hours limit conversion |
-| `STOP_LOSS_CENTS` | No | Initial stop distance from entry |
+| `HARD_STOP_PCT` | No | Default hard-stop distance as a percent of entry for stocks above the cheap-stock threshold |
+| `HARD_STOP_MIN_CENTS` | No | Minimum hard-stop distance in dollars |
+| `HARD_STOP_CHEAP_MAX_PRICE` | No | Price threshold below which the cheap-stock hard-stop percent is used |
+| `HARD_STOP_CHEAP_PCT` | No | Hard-stop distance percent used for stocks at or below the cheap-stock threshold |
 | `FLOOR_CHECK_INTERVAL_SECS` | No | Polling interval for floor monitor |
 | `FLOOR_AT_1PCT` | No | Profit floor applied at 1 percent profit |
 | `FLOOR_AT_2PCT` | No | Profit floor applied at 2 percent profit |
@@ -232,17 +237,20 @@ Notes:
 
 ## TradingView Script Status
 
-The TradingView Pine script is now stored in this repository at `tradingview/macd-momentum-alerts-v3.4.2_1.pine`.
+The current TradingView Pine pair is stored in this repository at:
 
-Codex can maintain that file here, but cannot directly edit the TradingView website itself from this environment. The intended workflow is:
+- `tradingview/multi-path-momentum-scalp-v1.0-indicator.pine`
+- `tradingview/multi-path-momentum-scalp-v1.0-strategy.pine`
 
-1. Update the Pine file in this repo.
+Codex can maintain those files here, but cannot directly edit the TradingView website itself from this environment. The intended workflow is:
+
+1. Update the indicator and paired strategy in this repo.
 2. Review and commit the changes in GitHub.
-3. Paste the latest script into TradingView manually.
+3. Paste the latest indicator/strategy into TradingView manually.
 
 ## Recommended Next Steps
 
 1. Keep the `src/` implementation as the source of truth.
-2. Keep webhook payload fields synchronized between the Pine script and `src/routes/webhook.js`.
+2. Keep webhook payload fields synchronized between the Pine indicator and `src/routes/webhook.js`.
 3. Use `docs/MACD_Momentum_System_Architecture_2026-04-13.md` as the current system design reference.
 4. Keep expanding automated coverage around webhook and Schwab-facing behavior before deeper refactors.

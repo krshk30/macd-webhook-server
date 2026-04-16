@@ -1,30 +1,24 @@
 // =====================================================================
-// MACD MOMENTUM ALERTS v3.4.2 -- VWAP Distance Filter
+// MULTI-PATH MOMENTUM SCALP v1.0 (Indicator) -- 5 Entry Paths
 // =====================================================================
-// v3.4.2 CHANGES:
-//   - VWAP MAX DISTANCE: blocks entry when price > X% above session VWAP
-//     Configurable via "VWAP Max % Above" setting (default 10%, set 0 = OFF)
-//     Only applies INSIDE the session (0930-1600). Pre/post market entries
-//     are NOT blocked — no stale previous-day VWAP comparisons.
+// Live alerts version. Fires webhook alerts to Railway server for
+// execution. Server handles scale-outs, profit floor, tiered exits.
 //
-// v3.4 CHANGES:
-//   - STOCHK ENTRY CAP: blocks entry when StochK >= 90 (overbought)
-//   - EMA9 MAX DISTANCE: blocks entry when price > 8% above EMA9
-//   - P1 MIN BARS BELOW: MACD must be below signal for 3+ bars before cross
-//   - P3 STRICTER SCORE: P3 surge requires 5/6 quality (vs 4/6 for P1/P2)
-//   - P3 HISTOGRAM FLOOR: minimum histogram 0.01 for P3
-//   - P3 ABOVE EMA9: P3 requires price > EMA9
-//   - EXITS FIRE INTRABAR: no barstate.isconfirmed on exits/scales
-//   - LABELS SHOW PROFIT: exit labels show current% (pk:peak%)
-//   - TIER USES PEAK: profitTier based on maxProfitPct, not current
+// ENTRY PATHS (strict priority order, one per bar):
+//   P1_CROSS    — MACD cross above signal
+//   P2_VWAP     — VWAP breakout with MACD above signal
+//   P3_SURGE    — MACD momentum surge (no cross required)
+//   P4_BURST    — Violent impulse bar (body/range expansion)
+//   P5_PULLBACK — Dip to EMA9 + resume + mini-breakout
 //
-// v3.3: Tiered exits, profit floor, EMA20 hard gate
-// v3.2: Triple-layer alert dedup
-// v3.1: Three entry paths with confirmation + quality scoring
+// P1/P2/P3: Use momentum filters (EMA20 gate, StochK cap, EMA9 max
+//   distance, VWAP cap). Go through 2-bar confirmation if enabled.
+// P4/P5: Use their own internal filters only. Fire instantly. Only
+//   trigger when higher-priority paths did not fire on this bar.
 // =====================================================================
 
 //@version=5
-indicator("MACD Confirmed Entry v3.4.2",
+indicator("Multi-Path Momentum Scalp v1.0",
      overlay          = true,
      max_labels_count = 500)
 
@@ -41,7 +35,7 @@ webhookToken = input.string("your-token-here", "Webhook Token", group = grpWebho
      tooltip = "Must match WEBHOOK_TOKEN in your Railway server.")
 
 grpConfirm = "Confirmed Entry"
-confirmBars   = input.int(2, "Confirmation Bars", minval = 1, maxval = 5, group = grpConfirm,
+confirmBars   = input.int(1, "Confirmation Bars", minval = 1, maxval = 5, group = grpConfirm,
      tooltip = "How many bars to wait after trigger before entering.")
 minScore      = input.int(4, "Min Quality Score", minval = 1, maxval = 6, group = grpConfirm,
      tooltip = "Minimum quality score (out of 6) required to enter.")
@@ -66,6 +60,64 @@ p3MinScore  = input.int(5,     "P3: Min Quality Score",         minval = 1, maxv
      tooltip = "P3 surge requires stricter quality score than P1/P2. Default 5 out of 6.")
 p3PrevBarGreen = input.bool(false, "P3: Previous Bar Green", group = grpPaths,
      tooltip = "P3 requires the previous bar was green (close > open). Blocks surges after failed momentum.")
+p3AllowHighVwap = input.bool(true, "P3: Allow High VWAP Continuation", group = grpPaths,
+     tooltip = "Lets P3 entries bypass the normal VWAP cap only when the move is still tight to EMA9 and trend structure remains clean.")
+p3HighVwapMaxPct = input.float(30.0, "P3: Max % Above VWAP", step = 1.0, group = grpPaths,
+     tooltip = "Upper cap for the P3 VWAP override. Blocks true blow-off moves even when P3 trend structure is strong.")
+p3HighVwapMaxEMA9Pct = input.float(2.0, "P3: Max % Above EMA9", step = 0.25, group = grpPaths,
+     tooltip = "When using the P3 VWAP override, price must still stay tight to EMA9.")
+p3AllowMomentumOverride = input.bool(true, "P3: Allow News Spike Override", group = grpPaths,
+     tooltip = "Lets P3 continuation entries bypass the StochK and EMA9 stretch filters when a catalyst move is still trending cleanly.")
+p3MomentumMaxEMA9Pct = input.float(12.0, "P3: Spike Max % Above EMA9", step = 0.5, group = grpPaths,
+     tooltip = "Upper EMA9 extension allowed for the P3 news spike override. Use this to catch orderly low-float trend days without opening the gate too wide.")
+p3MomentumMaxStochK = input.int(98, "P3: Spike Max StochK", minval = 80, maxval = 100, group = grpPaths,
+     tooltip = "Upper StochK allowed for the P3 news spike override. Strong trends can stay overbought for a long time, so this is looser than the normal entry cap.")
+p3MomentumVolMult = input.float(2.0, "P3: Spike Min Volume x Avg", step = 0.25, group = grpPaths,
+     tooltip = "Minimum current volume relative to a 20-bar average needed for the P3 news spike override.")
+
+// --- P4: BURST SCALP (v3.5) ------------------------------------------
+grpP4Burst = "P4: Burst Scalp"
+enablePath4 = input.bool(true, "Enable P4: Burst Scalp", group = grpP4Burst,
+     tooltip = "P4 catches violent impulse bars BEFORE MACD crosses above signal. Only fires if P1/P2/P3 did NOT trigger this bar.")
+p4BodyPct = input.float(4.0, "P4: Min Body % From Open", step = 0.5, group = grpP4Burst,
+     tooltip = "Minimum candle body expansion for burst. Keeps entries on truly violent bars.")
+p4RangePct = input.float(5.0, "P4: Min Range % From Open", step = 0.5, group = grpP4Burst,
+     tooltip = "Minimum full-range expansion for burst. Either body OR range must meet threshold.")
+p4CloseTopPct = input.float(35.0, "P4: Close In Top % Of Range", step = 5.0, group = grpP4Burst,
+     tooltip = "35 means the breakout bar must close in the top 35% of its range.")
+p4VolMult20 = input.float(1.50, "P4: Volume x 20-Bar Avg", step = 0.25, group = grpP4Burst,
+     tooltip = "Relative volume requirement versus the 20-bar average.")
+p4BreakoutLookback = input.int(3, "P4: Break Recent High Lookback", minval = 1, maxval = 10, group = grpP4Burst,
+     tooltip = "How far back to check for a nearby breakout high.")
+p4RequireCloseAboveEMA9 = input.bool(true, "P4: Require Close Above EMA9", group = grpP4Burst,
+     tooltip = "If on, P4 only triggers when close is above EMA9.")
+
+// --- P5: PULLBACK SCALP (v3.5) ---------------------------------------
+grpP5Pullback = "P5: Pullback Scalp"
+enablePath5 = input.bool(true, "Enable P5: Pullback Scalp", group = grpP5Pullback,
+     tooltip = "P5 catches dip-to-EMA9-and-resume entries after a spike. Only fires if P1/P2/P3/P4 did NOT trigger this bar.")
+p5SpikeLookback = input.int(15, "P5: Spike Anchor Lookback Bars", minval = 5, maxval = 30, group = grpP5Pullback,
+     tooltip = "How far back to search for a recent spike anchor (green bar with high significantly above its EMA9).")
+p5SpikeExtPct = input.float(2.5, "P5: Spike Extension Above EMA9 %", step = 0.5, group = grpP5Pullback,
+     tooltip = "How far the spike bar high must be above its EMA9 to qualify as a spike anchor.")
+p5GivebackPct = input.float(2.0, "P5: Min Giveback From Spike %", step = 0.5, group = grpP5Pullback,
+     tooltip = "How far price must have pulled back from the spike high. Resume bar open must be at least this much below spike high.")
+p5NearEma9Pct = input.float(1.0, "P5: Resume Near EMA9 %", step = 0.10, group = grpP5Pullback,
+     tooltip = "How close the resume bar open or low must be to EMA9.")
+p5MaxBodyPct = input.float(3.5, "P5: Max Resume Body %", step = 0.5, group = grpP5Pullback,
+     tooltip = "Maximum body size for resume bar. Keeps P5 entries distinct from P4 burst bars.")
+p5VolMult5 = input.float(0.90, "P5: Volume x 5-Bar Avg", step = 0.05, group = grpP5Pullback,
+     tooltip = "Light relative-volume requirement. Lower than other paths since pullback bars are quieter.")
+p5CloseRatio = input.float(0.50, "P5: Resume Close Ratio", step = 0.05, group = grpP5Pullback,
+     tooltip = "Where resume bar must close inside its range. 0.50 = close must finish in upper 50%.")
+p5BreakoutBars = input.int(3, "P5: Breakout Lookback Bars", minval = 2, maxval = 5, group = grpP5Pullback,
+     tooltip = "Resume bar must close above highest high of this many prior bars. Turns entry into a mini-breakout.")
+p5MomentumLookback = input.int(12, "P5: Prior Upmove Lookback", minval = 3, maxval = 30, group = grpP5Pullback,
+     tooltip = "How far back to measure recent upward progress as a secondary check.")
+p5MomentumMinPct = input.float(3.0, "P5: Prior Upmove Min %", step = 0.5, group = grpP5Pullback,
+     tooltip = "Minimum recent upmove required as a secondary check.")
+p5MaxFromHighPct = input.float(20.0, "P5: Max % From Session High", step = 5.0, group = grpP5Pullback,
+     tooltip = "Only allow P5 entries when price is within this distance of session high. Prevents falling-knife entries.")
 
 grpEMA   = "EMAs"
 ema1Len  = input.int(9,    "EMA 1 Length",     minval = 1, group = grpEMA)
@@ -103,14 +155,14 @@ floorTrailGap  = input.float(1.5, "Trail Gap above 4%",  step = 0.25, group = gr
      tooltip = "Above 4% profit, floor = peak profit minus this gap. E.g. peak 6%, gap 1.5% → floor 4.5%.")
 
 grpFilt  = "Filters"
-volMin      = input.int(10000, "Volume Threshold",    group = grpFilt)
-cooldownLen = input.int(5,     "Cooldown Bars",        group = grpFilt)
+volMin      = input.int(5000, "Volume Threshold",    group = grpFilt)
+cooldownLen = input.int(0,     "Cooldown Bars",        group = grpFilt)
 useRegHours = input.bool(true, "Trading Hours Filter", group = grpFilt)
 regStartH   = input.int(7,     "  Start Hour",        group = grpFilt)
 regStartM   = input.int(0,     "  Start Min",         group = grpFilt)
-regEndH     = input.int(16,    "  End Hour",          group = grpFilt)
+regEndH     = input.int(18,    "  End Hour",          group = grpFilt)
 regEndM     = input.int(0,     "  End Min",           group = grpFilt)
-useDeadZone = input.bool(true, "Enable Dead Zone",     group = grpFilt)
+useDeadZone = input.bool(false, "Enable Dead Zone",     group = grpFilt)
 deadStartH  = input.int(12,    "  DZ Start Hour",     group = grpFilt)
 deadStartM  = input.int(1,     "  DZ Start Min",      group = grpFilt)
 deadEndH    = input.int(15,    "  DZ End Hour",        group = grpFilt)
@@ -201,6 +253,7 @@ inDeadZone  = useDeadZone and currentMins >= deadStart and currentMins < deadEnd
 timeAllowed = regHoursOk and not inDeadZone
 
 volOk = volume > volMin
+volAvg20 = ta.sma(volume, 20)
 
 // v3.3: EMA20 hard gate — blocks all entries when price below EMA20
 emaGateOk = requireAboveEMA ? close > ema2 : true
@@ -215,10 +268,32 @@ ema9DistGateOk = useEMA9MaxDist ? ema9DistPct < ema9MaxDistPct : true
 // v3.4.2: VWAP max distance — only applied INSIDE session (0930-1600)
 // Outside session: sessVwap is stale from previous day — skip filter entirely
 vwapDistPct    = inSession and sessVwap > 0 ? ((close - sessVwap) / sessVwap * 100) : 0
-vwapDistGateOk = (vwapMaxDistPct > 0 and inSession and sessVwap > 0) ? vwapDistPct < vwapMaxDistPct : true
+vwapDistBaseGateOk = (vwapMaxDistPct > 0 and inSession and sessVwap > 0) ? vwapDistPct < vwapMaxDistPct : true
+ema9TrendRising = ema1 > ema1[1] and ema1[1] > ema1[2]
+p3HighVwapTrendOk = p3AllowHighVwap
+     and not vwapDistBaseGateOk
+     and inSession
+     and sessVwap > 0
+     and vwapMaxDistPct > 0
+     and vwapDistPct < p3HighVwapMaxPct
+     and close > ema1
+     and ema1 > ema2
+     and ema9DistPct <= p3HighVwapMaxEMA9Pct
+     and ema9TrendRising
+p3MomentumOverrideOk = p3AllowMomentumOverride
+     and emaGateOk
+     and close > ema1
+     and ema1 > ema2
+     and ema9TrendRising
+     and ema9DistPct <= p3MomentumMaxEMA9Pct
+     and stochK <= p3MomentumMaxStochK
+     and volume >= nz(volAvg20, volume) * p3MomentumVolMult
+     and (not inSession or vwapDistPct <= p3HighVwapMaxPct)
 
-// v3.4: Combined entry gate
-allGatesOk = emaGateOk and stochKGateOk and ema9DistGateOk and vwapDistGateOk
+// v3.4.3: P1/P2 keep the base VWAP cap; P3 can use the controlled high-VWAP continuation override
+commonGatesOk = emaGateOk and stochKGateOk and ema9DistGateOk
+p1p2GatesOk = commonGatesOk and vwapDistBaseGateOk
+p3GatesOk = (commonGatesOk and (vwapDistBaseGateOk or p3HighVwapTrendOk)) or p3MomentumOverrideOk
 
 
 // --- COOLDOWN --------------------------------------------------------
@@ -265,7 +340,7 @@ var bool  floorActive   = false
 
 rawTriggerP1 = enablePath1
      and macdWasBelowEnough
-     and allGatesOk
+     and p1p2GatesOk
      and not inPosition
      and not buyAlertFired
 
@@ -273,7 +348,7 @@ rawTriggerP2 = enablePath2
      and vwapCrossAbove
      and macdAboveSignal
      and macdIncreasing
-     and allGatesOk
+     and p1p2GatesOk
      and not inPosition
      and not buyAlertFired
 
@@ -285,11 +360,117 @@ rawTriggerP3 = enablePath3
      and histValue >= p3HistFloor
      and (not p3RequireAboveEMA9 or close > ema1)
      and (not p3PrevBarGreen or close[1] > open[1])
-     and allGatesOk
+     and p3GatesOk
      and not inPosition
      and not buyAlertFired
 
-rawTrigger = rawTriggerP1 or rawTriggerP2 or rawTriggerP3
+// --- P4: BURST SCALP RAW TRIGGER (v3.5) ------------------------------
+// Priority: P4 only fires if P1/P2/P3 did NOT trigger on this bar
+// Uses ONLY v1.5's internal burst filters — no momentum gates applied
+// Bypasses 2-bar confirmation (burst is a same-bar impulse play)
+
+p1p2p3FiredThisBar = rawTriggerP1 or rawTriggerP2 or rawTriggerP3
+
+p4BodyPctCalc = open > 0 ? ((close - open) / open) * 100.0 : 0.0
+p4RangePctCalc = open > 0 ? ((high - low) / open) * 100.0 : 0.0
+p4CloseNearHigh = high > low ? close >= low + (high - low) * (1 - p4CloseTopPct / 100.0) : true
+p4VolOk = volume >= nz(volAvg20, volume) * p4VolMult20
+p4BreaksRecentHigh = high > ta.highest(high[1], p4BreakoutLookback)
+
+rawTriggerP4 = enablePath4
+     and not p1p2p3FiredThisBar
+     and close > open
+     and (p4BodyPctCalc >= p4BodyPct or p4RangePctCalc >= p4RangePct)
+     and p4CloseNearHigh
+     and p4VolOk
+     and p4BreaksRecentHigh
+     and (not p4RequireCloseAboveEMA9 or close > ema1)
+     and not inPosition
+     and not buyAlertFired
+
+// --- P5: PULLBACK SCALP RAW TRIGGER (v3.5) ---------------------------
+// Priority: P5 only fires if P1/P2/P3/P4 did NOT trigger on this bar
+// Uses ONLY v1.5's internal pullback filters — no momentum gates applied
+// Spike anchor + giveback to EMA9 + green resume bar breaking short-term resistance
+
+var int p5SpikeAnchorBar = na
+var float p5SpikeAnchorHigh = na
+var float p5SessionHigh = na
+
+// Session-high tracking uses bar_index day change (independent of momentum's session)
+newTradeDay = ta.change(time("D")) != 0
+if newTradeDay
+    p5SessionHigh := high
+    p5SpikeAnchorBar := na
+    p5SpikeAnchorHigh := na
+else
+    p5SessionHigh := math.max(nz(p5SessionHigh, high), high)
+
+p5FromHighPct = p5SessionHigh > 0 ? ((p5SessionHigh - close) / p5SessionHigh) * 100.0 : 0.0
+p5NearHighOk = p5FromHighPct <= p5MaxFromHighPct
+
+// Spike anchor tracking
+p5CurrentSpikeExt = ema1 > 0 ? ((high - ema1) / ema1) * 100.0 : 0.0
+p5IsSpikeBar = close > open and p5CurrentSpikeExt >= p5SpikeExtPct
+if p5IsSpikeBar
+    p5SpikeAnchorBar := bar_index
+    p5SpikeAnchorHigh := high
+
+p5SpikeRecent = not na(p5SpikeAnchorBar) and (bar_index - p5SpikeAnchorBar) <= p5SpikeLookback and (bar_index - p5SpikeAnchorBar) >= 2
+
+// Giveback from spike
+p5GivebackOk = p5SpikeRecent and p5SpikeAnchorHigh > 0 ? ((p5SpikeAnchorHigh - open) / p5SpikeAnchorHigh) * 100.0 >= p5GivebackPct : false
+
+// Resume bar near EMA9
+p5OpenNearEma9 = ema1 > 0 ? math.abs((open - ema1) / ema1) * 100.0 <= p5NearEma9Pct : false
+p5LowNearEma9 = ema1 > 0 ? math.abs((low - ema1) / ema1) * 100.0 <= p5NearEma9Pct : false
+p5DipBelowEma9 = low <= ema1
+p5SupportTouchOk = p5OpenNearEma9 or p5LowNearEma9 or p5DipBelowEma9
+
+// Resume bar quality
+p5ResumeGreen = close > open
+p5ResumeAboveEma9 = close > ema1
+p5ResumeBodyPct = open > 0 ? ((close - open) / open) * 100.0 : 0.0
+p5ResumeNotBurst = p5ResumeBodyPct < p5MaxBodyPct
+p5ResumeClosePos = high > low ? (close - low) / (high - low) : 0.0
+p5ResumeQualityOk = p5ResumeClosePos >= p5CloseRatio
+
+// Volume (5-bar avg)
+p5VolAvg5 = ta.sma(volume, 5)
+p5ResumeVolOk = volume >= nz(p5VolAvg5, volume) * p5VolMult5
+
+// Mini-breakout
+p5RecentResistance = ta.highest(high[1], p5BreakoutBars)
+p5BreakoutOk = close > p5RecentResistance
+
+// EMA9 not crashing
+p5Ema9NotCrashing = ema1 >= ema1[1] * 0.995
+
+// Secondary momentum
+p5RecentLow = ta.lowest(low, p5MomentumLookback)
+p5UpmovePct = p5RecentLow > 0 ? ((close - p5RecentLow) / p5RecentLow) * 100.0 : 0.0
+p5MomentumOk = p5UpmovePct >= p5MomentumMinPct
+
+p1p2p3p4FiredThisBar = p1p2p3FiredThisBar or rawTriggerP4
+
+rawTriggerP5 = enablePath5
+     and not p1p2p3p4FiredThisBar
+     and p5NearHighOk
+     and p5SpikeRecent
+     and p5GivebackOk
+     and p5SupportTouchOk
+     and p5ResumeGreen
+     and p5ResumeAboveEma9
+     and p5ResumeNotBurst
+     and p5ResumeQualityOk
+     and p5ResumeVolOk
+     and p5BreakoutOk
+     and p5Ema9NotCrashing
+     and p5MomentumOk
+     and not inPosition
+     and not buyAlertFired
+
+rawTrigger = rawTriggerP1 or rawTriggerP2 or rawTriggerP3 or rawTriggerP4 or rawTriggerP5
 
 
 // --- CONFIRMATION STATE MACHINE --------------------------------------
@@ -303,7 +484,11 @@ var string triggerPath      = ""
 
 confirmCount = confirmState == 1 ? bar_index - triggerBarIdx : 0
 
-if rawTrigger and confirmState == 0
+// Only P1/P2/P3 go through confirmation state machine
+// P4/P5 always fire instantly via the instantP4/instantP5 path below
+rawTriggerConfirmEligible = rawTriggerP1 or rawTriggerP2 or rawTriggerP3
+
+if rawTriggerConfirmEligible and confirmState == 0
     confirmState     := 1
     triggerBarIdx    := bar_index
     crossPrice       := close
@@ -377,11 +562,29 @@ instantP3 = not useConfirm and rawTriggerP3
      and bar_index != lastBuyBar
      and barCloseOk
 
-instantEntry = instantP1 or instantP2 or instantP3
+// P4 and P5 always fire instantly (bypass 2-bar confirmation)
+// Still respect cooldown, time-allowed, and position tracking
+instantP4 = rawTriggerP4
+     and not cooldownActive and timeAllowed
+     and not inPosition and not buyAlertFired
+     and bar_index != lastBuyBar
+     and barCloseOk
+
+instantP5 = rawTriggerP5
+     and not cooldownActive and timeAllowed
+     and not inPosition and not buyAlertFired
+     and bar_index != lastBuyBar
+     and barCloseOk
+
+instantEntry = instantP1 or instantP2 or instantP3 or instantP4 or instantP5
 entrySignal  = confirmedEntry or instantEntry
 
 entryPath = confirmedEntry ? triggerPath :
-     instantP1 ? "P1_CROSS" : instantP2 ? "P2_VWAP" : "P3_SURGE"
+     instantP1 ? "P1_CROSS" :
+     instantP2 ? "P2_VWAP" :
+     instantP3 ? "P3_SURGE" :
+     instantP4 ? "P4_BURST" :
+     "P5_PULLBACK"
 
 
 // --- PROFIT TRACKING + FLOOR SYSTEM (v3.3) ---------------------------
@@ -623,6 +826,16 @@ plotshape(showSignals and entrySignal and entryPath == "P3_SURGE",
      location.belowbar, color.new(color.lime, 0), size = size.normal,
      text = "BUY\nSURGE", textcolor = color.black)
 
+plotshape(showSignals and entrySignal and entryPath == "P4_BURST",
+     "P4: Burst Scalp", shape.labelup,
+     location.belowbar, color.new(color.orange, 0), size = size.normal,
+     text = "BUY\nBURST", textcolor = color.black)
+
+plotshape(showSignals and entrySignal and entryPath == "P5_PULLBACK",
+     "P5: Pullback Scalp", shape.labelup,
+     location.belowbar, color.new(color.fuchsia, 0), size = size.normal,
+     text = "BUY\nPULL", textcolor = color.white)
+
 plotshape(showConfirmMarkers and rawTrigger and useConfirm and not inPosition and confirmState == 1,
      "Trigger Detected", shape.diamond,
      location.belowbar, color.new(color.gray, 0), size = size.tiny,
@@ -682,7 +895,7 @@ if showDash and barstate.islast
          border_width = 1,
          border_color = color.new(color.gray, 60))
 
-    table.cell(dash, 0, 0, "Confirmed v3.4.2", text_color = color.white, text_size = size.small)
+    table.cell(dash, 0, 0, "Confirmed v3.4.4", text_color = color.white, text_size = size.small)
     table.cell(dash, 1, 0, "LIVE",        text_color = color.lime,  text_size = size.small)
 
     table.cell(dash, 0, 1, "Price",       text_color = color.white, text_size = size.tiny)
@@ -793,18 +1006,20 @@ if showDash and barstate.islast
 
     table.cell(dash, 0, 21, "EMA9 Dist", text_color = color.white, text_size = size.tiny)
     ema9DistInfo = not useEMA9MaxDist ? "OFF" : ema9DistGateOk ? "PASS (" + str.tostring(ema9DistPct, "#.1") + "%)" : "BLOCKED (" + str.tostring(ema9DistPct, "#.1") + "%>=" + str.tostring(ema9MaxDistPct, "#.0") + "%)"
+    ema9DistInfo := p3MomentumOverrideOk and not ema9DistGateOk ? "P3 OVERRIDE (" + str.tostring(ema9DistPct, "#.1") + "%)" : ema9DistInfo
     table.cell(dash, 1, 21, ema9DistInfo,
-         text_color = not useEMA9MaxDist ? color.gray : ema9DistGateOk ? color.green : color.red, text_size = size.tiny)
+         text_color = not useEMA9MaxDist ? color.gray : ema9DistGateOk ? color.green : p3MomentumOverrideOk ? color.aqua : color.red, text_size = size.tiny)
 
     table.cell(dash, 0, 22, "VWAP Dist",  text_color = color.white, text_size = size.tiny)
     vwapDistInfo = vwapMaxDistPct <= 0 ? "OFF" :
          not inSession ? "N/A (pre/post mkt)" :
-         vwapDistGateOk ? "PASS (" + str.tostring(vwapDistPct, "#.1") + "%)" :
+         vwapDistBaseGateOk ? "PASS (" + str.tostring(vwapDistPct, "#.1") + "%)" :
+         p3HighVwapTrendOk ? "P3 OVERRIDE (" + str.tostring(vwapDistPct, "#.1") + "%)" :
          "BLOCKED (" + str.tostring(vwapDistPct, "#.1") + "%>=" + str.tostring(vwapMaxDistPct, "#.0") + "%)"
     table.cell(dash, 1, 22, vwapDistInfo,
-         text_color = vwapMaxDistPct <= 0 ? color.gray : not inSession ? color.gray : vwapDistGateOk ? color.green : color.red, text_size = size.tiny)
+         text_color = vwapMaxDistPct <= 0 ? color.gray : not inSession ? color.gray : vwapDistBaseGateOk ? color.green : p3HighVwapTrendOk ? color.aqua : color.red, text_size = size.tiny)
 
     table.cell(dash, 0, 23, "Entry",      text_color = color.white, text_size = size.tiny)
-    entryStatus = entrySignal ? "BUY " + entryPath : inPosition ? "- in position" : not regHoursOk ? "X outside hours" : not emaGateOk ? "X below EMA20" : not stochKGateOk ? "X StochK overbought" : not ema9DistGateOk ? "X EMA9 too far" : not vwapDistGateOk ? "X VWAP too far (" + str.tostring(vwapDistPct, "#.1") + "%)" : not macdAboveSignal ? "X MACD bearish" : confirmState == 1 ? "CONFIRMING " + triggerPath : inDeadZone ? "X dead zone" : cooldownActive ? "X cooldown" : "Waiting..."
+    entryStatus = entrySignal ? "BUY " + entryPath : inPosition ? "- in position" : not regHoursOk ? "X outside hours" : not emaGateOk ? "X below EMA20" : p3MomentumOverrideOk ? "P3 spike override ready" : not stochKGateOk ? "X StochK overbought" : not ema9DistGateOk ? "X EMA9 too far" : not vwapDistBaseGateOk and not p3HighVwapTrendOk ? "X VWAP too far (" + str.tostring(vwapDistPct, "#.1") + "%)" : p3HighVwapTrendOk and not macdAboveSignal ? "P3 VWAP override ready" : not macdAboveSignal ? "X MACD bearish" : confirmState == 1 ? "CONFIRMING " + triggerPath : inDeadZone ? "X dead zone" : cooldownActive ? "X cooldown" : "Waiting..."
     table.cell(dash, 1, 23, entryStatus,
          text_color = entrySignal ? color.green : confirmState == 1 ? color.yellow : color.gray, text_size = size.tiny)

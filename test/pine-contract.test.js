@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const pinePath = path.join(__dirname, '..', 'tradingview', 'macd-momentum-alerts-v3.4.2_1.pine');
+const pinePath = path.join(__dirname, '..', 'tradingview', 'multi-path-momentum-scalp-v1.0-indicator.pine');
 const pineSource = fs.readFileSync(pinePath, 'utf8');
 
 function expectAlertContains(action, snippets) {
