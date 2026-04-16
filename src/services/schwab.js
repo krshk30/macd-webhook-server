@@ -170,7 +170,18 @@ async function getCurrentPrice(ticker) {
     return prices[ticker] || 0;
 }
 
-async function getCurrentPrices(tickers) {
+function selectFloorTriggerPrice(quote = {}) {
+    const bidPrice = Number(quote.bidPrice || 0);
+    const lastPrice = Number(quote.lastPrice || 0);
+
+    if (isRegularHours() && lastPrice > 0) {
+        return lastPrice;
+    }
+
+    return bidPrice > 0 ? bidPrice : lastPrice;
+}
+
+async function getCurrentQuotes(tickers) {
     const uniqueTickers = Array.from(new Set((tickers || []).filter(Boolean)));
     if (uniqueTickers.length === 0) return {};
 
@@ -181,27 +192,44 @@ async function getCurrentPrices(tickers) {
             httpsAgent: keepAliveAgent, timeout: 5000
         });
 
-        const prices = {};
+        const quotes = {};
         for (const ticker of uniqueTickers) {
             const quote = r.data?.[ticker]?.quote || {};
-            const bidPrice = quote.bidPrice || 0;
-            const lastPrice = quote.lastPrice || 0;
+            const bidPrice = Number(quote.bidPrice || 0);
+            const lastPrice = Number(quote.lastPrice || 0);
             const price = bidPrice > 0 ? bidPrice : lastPrice;
-            prices[ticker] = price;
-            log('INFO', `Current price ${ticker}`, { bid: bidPrice, last: lastPrice, using: price });
+            const floorTriggerPrice = selectFloorTriggerPrice({ bidPrice, lastPrice });
+            quotes[ticker] = { bidPrice, lastPrice, price, floorTriggerPrice };
+            log('INFO', `Current price ${ticker}`, {
+                bid: bidPrice,
+                last: lastPrice,
+                using: price,
+                floorTrigger: floorTriggerPrice
+            });
         }
 
-        return prices;
+        return quotes;
     } catch (e) {
         log('WARN', 'Batch price fetch failed', {
             tickers: uniqueTickers,
             error: e.response?.status || e.message
         });
 
-        const prices = {};
-        for (const ticker of uniqueTickers) prices[ticker] = 0;
-        return prices;
+        const quotes = {};
+        for (const ticker of uniqueTickers) {
+            quotes[ticker] = { bidPrice: 0, lastPrice: 0, price: 0, floorTriggerPrice: 0 };
+        }
+        return quotes;
     }
+}
+
+async function getCurrentPrices(tickers) {
+    const quotes = await getCurrentQuotes(tickers);
+    const prices = {};
+    for (const [ticker, quote] of Object.entries(quotes)) {
+        prices[ticker] = quote.price || 0;
+    }
+    return prices;
 }
 
 // v1.3.0: Get actual fill price from a completed order
@@ -1105,9 +1133,11 @@ async function checkManagedExits(pt) {
     const allPositions = pt.getAllPositions().filter(pos => pos.remainingQuantity > 0 && !pos.isClosing && !pos.isOrphan);
     if (allPositions.length === 0) return;
 
-    const prices = await getCurrentPrices(allPositions.map(pos => pos.ticker));
+    const quotes = await getCurrentQuotes(allPositions.map(pos => pos.ticker));
     for (const pos of allPositions) {
-        const currentPrice = prices[pos.ticker] || 0;
+        const quote = quotes[pos.ticker] || {};
+        const currentPrice = quote.price || 0;
+        const floorTriggerPrice = quote.floorTriggerPrice || currentPrice;
         if (currentPrice <= 0) continue;
 
         const profitPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
@@ -1185,21 +1215,24 @@ async function checkManagedExits(pt) {
         const { floorPct, computedFloorPrice, activeFloorPrice, currentStop } = floorState;
         if (floorPct <= -999) continue;
 
-        if (currentPrice <= activeFloorPrice && floorPct >= 0) {
-            log('FLOOR', `SERVER FLOOR BREACH: ${pos.ticker} price $${currentPrice.toFixed(2)} <= sticky floor $${activeFloorPrice.toFixed(2)}`, {
+        if (floorTriggerPrice <= activeFloorPrice && floorPct >= 0) {
+            log('FLOOR', `SERVER FLOOR BREACH: ${pos.ticker} price $${floorTriggerPrice.toFixed(2)} <= sticky floor $${activeFloorPrice.toFixed(2)}`, {
                 tradeId: pos.tradeId,
                 profitPct: profitPct.toFixed(2),
                 floorPct: floorPct.toFixed(2),
                 computedFloorPrice: computedFloorPrice.toFixed(2),
-                currentStop: currentStop.toFixed(2)
+                currentStop: currentStop.toFixed(2),
+                quotePrice: currentPrice.toFixed(2),
+                bidPrice: Number(quote.bidPrice || 0).toFixed(2),
+                lastPrice: Number(quote.lastPrice || 0).toFixed(2)
             });
             pos.isClosing = true;
             await cancelOrdersForTicker(pos.ticker);
             await new Promise(resolve => setTimeout(resolve, 300));
-            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'SERVER_FLOOR_BREACH', currentPrice);
+            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'SERVER_FLOOR_BREACH', floorTriggerPrice);
             if (result.success) {
                 if (result.needsFillConfirmation) {
-                    pt.createPendingClose(pos.ticker, currentPrice, pos.remainingQuantity, result.orderId, 'SERVER_FLOOR_BREACH', {
+                    pt.createPendingClose(pos.ticker, floorTriggerPrice, pos.remainingQuantity, result.orderId, 'SERVER_FLOOR_BREACH', {
                         session: result.session,
                         orderType: result.orderType
                     });
@@ -1210,17 +1243,17 @@ async function checkManagedExits(pt) {
                     tradeId: pos.tradeId,
                     ticker: pos.ticker,
                     entryPrice: pos.entryPrice,
-                    sellPrice: currentPrice,
+                    sellPrice: floorTriggerPrice,
                     floorPrice: activeFloorPrice,
                     floorPct: floorPct.toFixed(2),
                     profitPct: profitPct.toFixed(2)
                 });
-                const summary = pt.closePosition(pos.ticker, currentPrice, 'SERVER_FLOOR_BREACH');
+                const summary = pt.closePosition(pos.ticker, floorTriggerPrice, 'SERVER_FLOOR_BREACH');
                 if (summary) {
                     await notify(
                         `SERVER FLOOR BREACH: ${pos.ticker}\n` +
                         `TradeID: ${summary.tradeId}\n` +
-                        `Price $${currentPrice.toFixed(2)} hit floor $${activeFloorPrice.toFixed(2)}\n` +
+                        `Price $${floorTriggerPrice.toFixed(2)} hit floor $${activeFloorPrice.toFixed(2)}\n` +
                         `P&L: $${summary.pnl.toFixed(2)} | Total: $${summary.totalPnL.toFixed(2)}`,
                         summary.totalPnL >= 0 ? 'profit' : 'loss'
                     );
@@ -1285,7 +1318,8 @@ module.exports = {
         __test: {
             calculateFloor,
             getActiveFloorState,
-            getHardStopDistance
+            getHardStopDistance,
+            selectFloorTriggerPrice
         }
     }
 };

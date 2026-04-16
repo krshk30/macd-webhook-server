@@ -42,3 +42,29 @@ test('active floor advances when the newly computed floor is higher than the sto
     assert.equal(floorState.computedFloorPrice, 2.04);
     assert.equal(floorState.activeFloorPrice, 2.04);
 });
+
+test('floor trigger uses last price during regular hours but preserves bid fallback otherwise', () => {
+    const originalToLocaleString = Date.prototype.toLocaleString;
+
+    try {
+        Date.prototype.toLocaleString = function mockedToLocaleString() {
+            return '4/16/2026, 10:34:00 AM';
+        };
+
+        assert.equal(
+            schwabService.__test.selectFloorTriggerPrice({ bidPrice: 1.83, lastPrice: 1.89 }),
+            1.89
+        );
+
+        Date.prototype.toLocaleString = function mockedToLocaleStringExtended() {
+            return '4/16/2026, 8:34:00 AM';
+        };
+
+        assert.equal(
+            schwabService.__test.selectFloorTriggerPrice({ bidPrice: 1.83, lastPrice: 1.89 }),
+            1.83
+        );
+    } finally {
+        Date.prototype.toLocaleString = originalToLocaleString;
+    }
+});
