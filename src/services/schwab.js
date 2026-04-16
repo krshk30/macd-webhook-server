@@ -181,6 +181,17 @@ function selectFloorTriggerPrice(quote = {}) {
     return bidPrice > 0 ? bidPrice : lastPrice;
 }
 
+function selectHardStopTriggerPrice(quote = {}) {
+    const bidPrice = Number(quote.bidPrice || 0);
+    const lastPrice = Number(quote.lastPrice || 0);
+
+    if (isRegularHours() && lastPrice > 0) {
+        return lastPrice;
+    }
+
+    return bidPrice > 0 ? bidPrice : lastPrice;
+}
+
 async function getCurrentQuotes(tickers) {
     const uniqueTickers = Array.from(new Set((tickers || []).filter(Boolean)));
     if (uniqueTickers.length === 0) return {};
@@ -199,12 +210,14 @@ async function getCurrentQuotes(tickers) {
             const lastPrice = Number(quote.lastPrice || 0);
             const price = bidPrice > 0 ? bidPrice : lastPrice;
             const floorTriggerPrice = selectFloorTriggerPrice({ bidPrice, lastPrice });
-            quotes[ticker] = { bidPrice, lastPrice, price, floorTriggerPrice };
+            const hardStopTriggerPrice = selectHardStopTriggerPrice({ bidPrice, lastPrice });
+            quotes[ticker] = { bidPrice, lastPrice, price, floorTriggerPrice, hardStopTriggerPrice };
             log('INFO', `Current price ${ticker}`, {
                 bid: bidPrice,
                 last: lastPrice,
                 using: price,
-                floorTrigger: floorTriggerPrice
+                floorTrigger: floorTriggerPrice,
+                hardStopTrigger: hardStopTriggerPrice
             });
         }
 
@@ -217,7 +230,7 @@ async function getCurrentQuotes(tickers) {
 
         const quotes = {};
         for (const ticker of uniqueTickers) {
-            quotes[ticker] = { bidPrice: 0, lastPrice: 0, price: 0, floorTriggerPrice: 0 };
+            quotes[ticker] = { bidPrice: 0, lastPrice: 0, price: 0, floorTriggerPrice: 0, hardStopTriggerPrice: 0 };
         }
         return quotes;
     }
@@ -1138,26 +1151,30 @@ async function checkManagedExits(pt) {
         const quote = quotes[pos.ticker] || {};
         const currentPrice = quote.price || 0;
         const floorTriggerPrice = quote.floorTriggerPrice || currentPrice;
+        const hardStopTriggerPrice = quote.hardStopTriggerPrice || currentPrice;
         if (currentPrice <= 0) continue;
 
         const profitPct = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
         const hardStopDistance = getHardStopDistance(pos.entryPrice);
         const hardStopPrice = parseFloat((pos.entryPrice - hardStopDistance).toFixed(2));
 
-        if (currentPrice <= hardStopPrice) {
-            log('FLOOR', `HARD STOP: ${pos.ticker} price $${currentPrice.toFixed(2)} <= stop $${hardStopPrice.toFixed(2)}`, {
+        if (hardStopTriggerPrice <= hardStopPrice) {
+            log('FLOOR', `HARD STOP: ${pos.ticker} price $${hardStopTriggerPrice.toFixed(2)} <= stop $${hardStopPrice.toFixed(2)}`, {
                 tradeId: pos.tradeId,
                 entryPrice: pos.entryPrice,
                 profitPct: profitPct.toFixed(2),
-                stopDistance: hardStopDistance.toFixed(2)
+                stopDistance: hardStopDistance.toFixed(2),
+                quotePrice: currentPrice.toFixed(2),
+                bidPrice: Number(quote.bidPrice || 0).toFixed(2),
+                lastPrice: Number(quote.lastPrice || 0).toFixed(2)
             });
             pos.isClosing = true;
             await cancelOrdersForTicker(pos.ticker);
             await new Promise(resolve => setTimeout(resolve, 300));
-            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HARD_STOP', currentPrice);
+            const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HARD_STOP', hardStopTriggerPrice);
             if (result.success) {
                 if (result.needsFillConfirmation) {
-                    pt.createPendingClose(pos.ticker, currentPrice, pos.remainingQuantity, result.orderId, 'HARD_STOP', {
+                    pt.createPendingClose(pos.ticker, hardStopTriggerPrice, pos.remainingQuantity, result.orderId, 'HARD_STOP', {
                         session: result.session,
                         orderType: result.orderType
                     });
@@ -1168,16 +1185,16 @@ async function checkManagedExits(pt) {
                     tradeId: pos.tradeId,
                     ticker: pos.ticker,
                     entryPrice: pos.entryPrice,
-                    sellPrice: currentPrice,
+                    sellPrice: hardStopTriggerPrice,
                     hardStopPrice,
                     profitPct: profitPct.toFixed(2)
                 });
-                const summary = pt.closePosition(pos.ticker, currentPrice, 'HARD_STOP');
+                const summary = pt.closePosition(pos.ticker, hardStopTriggerPrice, 'HARD_STOP');
                 if (summary) {
                     await notify(
                         `HARD STOP: ${pos.ticker}\n` +
                         `TradeID: ${summary.tradeId}\n` +
-                        `Entry $${summary.entryPrice.toFixed(2)} -> Stop $${hardStopPrice.toFixed(2)} -> Sold $${currentPrice.toFixed(2)}\n` +
+                        `Entry $${summary.entryPrice.toFixed(2)} -> Stop $${hardStopPrice.toFixed(2)} -> Sold $${hardStopTriggerPrice.toFixed(2)}\n` +
                         `P&L: $${summary.pnl.toFixed(2)}`,
                         'loss'
                     );
@@ -1319,7 +1336,8 @@ module.exports = {
             calculateFloor,
             getActiveFloorState,
             getHardStopDistance,
-            selectFloorTriggerPrice
+            selectFloorTriggerPrice,
+            selectHardStopTriggerPrice
         }
     }
 };

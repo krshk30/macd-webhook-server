@@ -68,3 +68,29 @@ test('floor trigger uses last price during regular hours but preserves bid fallb
         Date.prototype.toLocaleString = originalToLocaleString;
     }
 });
+
+test('hard stop trigger uses last price during regular hours but preserves bid fallback otherwise', () => {
+    const originalToLocaleString = Date.prototype.toLocaleString;
+
+    try {
+        Date.prototype.toLocaleString = function mockedToLocaleString() {
+            return '4/16/2026, 10:34:00 AM';
+        };
+
+        assert.equal(
+            schwabService.__test.selectHardStopTriggerPrice({ bidPrice: 1.33, lastPrice: 1.34 }),
+            1.34
+        );
+
+        Date.prototype.toLocaleString = function mockedToLocaleStringExtended() {
+            return '4/16/2026, 8:34:00 AM';
+        };
+
+        assert.equal(
+            schwabService.__test.selectHardStopTriggerPrice({ bidPrice: 1.33, lastPrice: 1.34 }),
+            1.33
+        );
+    } finally {
+        Date.prototype.toLocaleString = originalToLocaleString;
+    }
+});
