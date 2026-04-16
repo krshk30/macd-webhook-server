@@ -654,3 +654,42 @@ test('close request keeps the position open locally when the close order still n
         assert.match(state.notifications[0].message, /CLOSE PENDING AAPL/);
     });
 });
+
+test('close request is ignored when a close is already in progress', async () => {
+    process.env.WEBHOOK_TOKEN = 'secret';
+
+    const position = {
+        tradeId: 'T-AAPL',
+        entryPrice: 100,
+        remainingQuantity: 6,
+        isClosing: true
+    };
+
+    const { app, state } = buildWebhookApp({
+        positions: {
+            getPosition: () => position
+        }
+    });
+
+    await withServer(app, async baseUrl => {
+        const response = await fetch(`${baseUrl}/webhook`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                action: 'CLOSE',
+                ticker: 'AAPL',
+                token: 'secret',
+                price: 99.4,
+                reason: 'STOCHK_TIER1_20'
+            })
+        });
+
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.success, true);
+        assert.equal(body.pending, true);
+        assert.equal(body.note, 'close already in progress');
+        assert.equal(state.sellCalls.length, 0);
+        assert.equal(state.notifications.length, 0);
+    });
+});

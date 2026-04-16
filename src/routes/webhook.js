@@ -177,6 +177,11 @@ async function handleScale(ticker, price, body) {
         return { success: false, rejected: 'close pending' };
     }
 
+    if (pos.isClosing) {
+        log('REJECT', `SCALE ${ticker}: close already in progress`, { tradeId: pos.tradeId });
+        return { success: false, rejected: 'close in progress' };
+    }
+
     const level = body.level;
     const sellPct = parseInt(body.sell_pct) || 50;
     const currentPrice = parseFloat(price) || 0;
@@ -291,6 +296,19 @@ async function handleClose(ticker, price, body) {
     if (!pos) {
         log('REJECT', `CLOSE ${ticker}: no position`);
         return { success: false, rejected: 'no position' };
+    }
+
+    if (pos.isClosing) {
+        log('INFO', `CLOSE ${ticker}: close already in progress`, { tradeId: pos.tradeId });
+        return {
+            success: true,
+            action: 'CLOSE',
+            tradeId: pos.tradeId,
+            ticker,
+            reason: body.reason || 'close_in_progress',
+            pending: true,
+            note: 'close already in progress'
+        };
     }
 
     const existingPendingClose = positions.getPendingClose(ticker);
