@@ -84,7 +84,7 @@ router.post('/webhook', async (req, res) => {
         stochK: body.stochK
     });
 
-    if (positions.isDuplicate(ticker, action)) {
+    if (positions.isDuplicate(ticker, action, body)) {
         return res.json({ status: 'duplicate_filtered', tradeId, latency: Date.now() - t0 });
     }
 

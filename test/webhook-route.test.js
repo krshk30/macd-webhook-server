@@ -382,6 +382,69 @@ test('duplicate scale milestones are ignored once already hit', async () => {
     });
 });
 
+test('different scale levels are not deduped against each other', async () => {
+    process.env.WEBHOOK_TOKEN = 'secret';
+
+    const seen = new Set();
+    const position = {
+        tradeId: 'T-AAPL',
+        entryPrice: 100,
+        remainingQuantity: 10
+    };
+
+    const { app, state } = buildWebhookApp({
+        positions: {
+            isDuplicate: (ticker, action, body) => {
+                const key = `${ticker}:${action}:${body?.level || ''}`;
+                if (seen.has(key)) return true;
+                seen.add(key);
+                return false;
+            },
+            getPosition: () => position,
+            previewScalePosition: () => ({ sharesToSell: 2, pnl: 4.6 }),
+            markMilestone: () => {},
+            scalePosition: () => ({ sharesToSell: 2, pnl: 4.6 }),
+            getStopPrice: () => 99.75
+        }
+    });
+
+    await withServer(app, async baseUrl => {
+        const first = await fetch(`${baseUrl}/webhook`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                action: 'SCALE',
+                ticker: 'AAPL',
+                token: 'secret',
+                price: 102.3,
+                level: 'PCT2',
+                sell_pct: 50
+            })
+        });
+
+        const second = await fetch(`${baseUrl}/webhook`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                action: 'SCALE',
+                ticker: 'AAPL',
+                token: 'secret',
+                price: 104.3,
+                level: 'PCT4_AFTER2',
+                sell_pct: 25
+            })
+        });
+
+        assert.equal(first.status, 200);
+        assert.equal(second.status, 200);
+        assert.equal((await first.json()).success, true);
+        assert.equal((await second.json()).success, true);
+        assert.equal(state.sellCalls.length, 2);
+        assert.deepEqual(state.sellCalls[0], ['AAPL', 2, 'Scale PCT2 (50%)', 102.3]);
+        assert.deepEqual(state.sellCalls[1], ['AAPL', 2, 'Scale PCT4_AFTER2 (25%)', 104.3]);
+    });
+});
+
 test('close request cancels a pending entry before fill', async () => {
     process.env.WEBHOOK_TOKEN = 'secret';
     const { app, state } = buildWebhookApp({

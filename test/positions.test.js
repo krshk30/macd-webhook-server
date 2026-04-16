@@ -67,6 +67,18 @@ test('duplicate detection filters repeated alerts inside the configured window',
     assert.equal(positions.isDuplicate('MSFT', 'SCALE'), false);
 });
 
+test('duplicate detection distinguishes scale levels and close reasons', () => {
+    const positions = loadPositionsModule();
+
+    assert.equal(positions.isDuplicate('MSFT', 'SCALE', { level: 'PCT2' }), false);
+    assert.equal(positions.isDuplicate('MSFT', 'SCALE', { level: 'FAST4' }), false);
+    assert.equal(positions.isDuplicate('MSFT', 'SCALE', { level: 'PCT2' }), true);
+
+    assert.equal(positions.isDuplicate('MSFT', 'CLOSE', { reason: 'MACD_BEAR' }), false);
+    assert.equal(positions.isDuplicate('MSFT', 'CLOSE', { reason: 'FLOOR_BREACH' }), false);
+    assert.equal(positions.isDuplicate('MSFT', 'CLOSE', { reason: 'MACD_BEAR' }), true);
+});
+
 test('pending entries block duplicate buys and can be activated on fill', () => {
     const positions = loadPositionsModule();
 

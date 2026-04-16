@@ -584,6 +584,8 @@ This file is the running record of repository analysis and updates for the curre
   - legacy `placeBuyOrder()` TRIGGER + child-stop path
   - legacy `checkFloors()` monitor
 - Updated `README.md` env-var docs to reflect the active hard-stop configuration and remove the stale `STOP_LOSS_CENTS` reference.
+- Tightened webhook dedup semantics so different `SCALE` levels and different `CLOSE` reasons are no longer collapsed into the same `ticker:action` key.
+- Added regression coverage for dedup specificity in both the positions service and webhook route tests.
 
 ## Ongoing Rule For Future Sessions
 

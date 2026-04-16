@@ -201,8 +201,18 @@ function resetDailyIfNeeded() {
 }
 
 // --- Dedup ---
-function isDuplicate(ticker, action) {
-    const k = `${ticker}:${action}`, now = Date.now(), last = recentAlerts.get(k);
+function buildDedupKey(ticker, action, webhookData = {}) {
+    if (action === 'SCALE') {
+        return `${ticker}:${action}:${webhookData.level || 'unknown'}`;
+    }
+    if (action === 'CLOSE') {
+        return `${ticker}:${action}:${webhookData.reason || 'unknown'}`;
+    }
+    return `${ticker}:${action}`;
+}
+
+function isDuplicate(ticker, action, webhookData = {}) {
+    const k = buildDedupKey(ticker, action, webhookData), now = Date.now(), last = recentAlerts.get(k);
     if (last && (now - last) < DEDUP_WINDOW_MS) {
         log('DEDUP', `Filtered duplicate: ${k}`, { agems: now - last });
         return true;
