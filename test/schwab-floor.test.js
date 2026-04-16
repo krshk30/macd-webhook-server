@@ -94,3 +94,8 @@ test('hard stop trigger uses last price during regular hours but preserves bid f
         Date.prototype.toLocaleString = originalToLocaleString;
     }
 });
+
+test('hard stop distance uses 2% for stocks at or below $2.50 and 1% above it', () => {
+    assert.equal(schwabService.__test.getHardStopDistance(1.3667), 0.03);
+    assert.equal(schwabService.__test.getHardStopDistance(3.83), 0.04);
+});

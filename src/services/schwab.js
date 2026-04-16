@@ -42,7 +42,12 @@ function getPendingEntryTimeoutSecs() { return parseInt(process.env.PENDING_ENTR
 function getPendingCloseCheckIntervalSecs() { return parseInt(process.env.PENDING_CLOSE_CHECK_INTERVAL_SECS || '5'); }
 function getPendingCloseTimeoutSecs() { return parseInt(process.env.PENDING_CLOSE_TIMEOUT_SECS || '15'); }
 function getHardStopDistance(entryPrice) {
-    const stopPct = parseFloat(process.env.HARD_STOP_PCT || '0.01');
+    const cheapMaxPrice = parseFloat(process.env.HARD_STOP_CHEAP_MAX_PRICE || '2.5');
+    const stopPct = parseFloat(
+        entryPrice <= cheapMaxPrice
+            ? (process.env.HARD_STOP_CHEAP_PCT || '0.02')
+            : (process.env.HARD_STOP_PCT || '0.01')
+    );
     const minCents = parseFloat(process.env.HARD_STOP_MIN_CENTS || '0.01');
     if (entryPrice <= 0) return minCents;
     return Math.max(minCents, parseFloat((entryPrice * stopPct).toFixed(2)));

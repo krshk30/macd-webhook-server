@@ -112,10 +112,10 @@ test('preview scale does not mutate state before an order is confirmed', () => {
     assert.equal(positions.isMilestoneHit('AAPL', 'FAST4'), false);
 });
 
-test('initial hard stop scales with price but still respects a one-cent minimum', () => {
+test('initial hard stop uses 2% for cheap stocks and 1% above $2.50', () => {
     const positions = loadPositionsModule();
 
-    positions.openPosition('CHEAP', 0.64, 10, {});
+    positions.openPosition('CHEAP', 1.3667, 10, {});
     positions.openPosition('MID', 6.9153, 10, {});
 
     const cheap = positions.getPosition('CHEAP');
@@ -123,7 +123,7 @@ test('initial hard stop scales with price but still respects a one-cent minimum'
 
     assert.ok(cheap);
     assert.ok(mid);
-    assert.equal(cheap.currentStopPrice, 0.63);
+    assert.equal(cheap.currentStopPrice, 1.34);
     assert.equal(mid.currentStopPrice, 6.85);
 });
 
