@@ -53,6 +53,7 @@ function getHardStopDistance(entryPrice) {
     return Math.max(minCents, parseFloat((entryPrice * stopPct).toFixed(2)));
 }
 function isServerManagedScalesEnabled() { return process.env.SERVER_MANAGED_SCALES !== 'false'; }
+function isServerManagedFloorBreachesEnabled() { return process.env.SERVER_MANAGED_FLOOR_BREACHES === 'true'; }
 function isBrokerOrphanImportEnabled() { return process.env.ENABLE_BROKER_ORPHAN_IMPORT === 'true'; }
 function getOrderType(req, price) {
     if (isRegularHours()) return req;
@@ -1233,6 +1234,8 @@ async function checkManagedExits(pt) {
             }
         }
 
+        if (!isServerManagedFloorBreachesEnabled()) continue;
+
         const floorState = getActiveFloorState(pos, profitPct);
         const { floorPct, computedFloorPrice, activeFloorPrice, currentStop } = floorState;
         if (floorPct <= -999) continue;
@@ -1341,6 +1344,7 @@ module.exports = {
             calculateFloor,
             getActiveFloorState,
             getHardStopDistance,
+            isServerManagedFloorBreachesEnabled,
             selectFloorTriggerPrice,
             selectHardStopTriggerPrice
         }

@@ -99,3 +99,12 @@ test('hard stop distance uses 2% for stocks at or below $2.50 and 1% above it', 
     assert.equal(schwabService.__test.getHardStopDistance(1.3667), 0.03);
     assert.equal(schwabService.__test.getHardStopDistance(3.83), 0.04);
 });
+
+test('server-managed floor breaches are disabled by default', () => {
+    delete process.env.SERVER_MANAGED_FLOOR_BREACHES;
+    assert.equal(schwabService.__test.isServerManagedFloorBreachesEnabled(), false);
+
+    process.env.SERVER_MANAGED_FLOOR_BREACHES = 'true';
+    assert.equal(schwabService.__test.isServerManagedFloorBreachesEnabled(), true);
+    delete process.env.SERVER_MANAGED_FLOOR_BREACHES;
+});
