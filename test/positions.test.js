@@ -126,3 +126,25 @@ test('initial hard stop scales with price but still respects a one-cent minimum'
     assert.equal(cheap.currentStopPrice, 0.63);
     assert.equal(mid.currentStopPrice, 6.85);
 });
+
+test('pending close state is created and cleared around an open position', () => {
+    const positions = loadPositionsModule();
+
+    positions.openPosition('AAPL', 100, 10, {});
+    const pendingClose = positions.createPendingClose('AAPL', 99.5, 10, 'OID-CLOSE-1', 'MACD_BEAR', {
+        session: 'SEAMLESS',
+        orderType: 'LIMIT'
+    });
+
+    assert.ok(pendingClose);
+    assert.equal(positions.hasPendingClose('AAPL'), true);
+    assert.equal(positions.getPendingClose('AAPL').orderId, 'OID-CLOSE-1');
+    assert.equal(positions.getPosition('AAPL').isClosing, true);
+
+    positions.updatePendingClose('AAPL', { processedFilledQuantity: 4 });
+    assert.equal(positions.getPendingClose('AAPL').processedFilledQuantity, 4);
+
+    positions.clearPendingClose('AAPL', 'test_clear');
+    assert.equal(positions.hasPendingClose('AAPL'), false);
+    assert.equal(positions.getPosition('AAPL').isClosing, false);
+});

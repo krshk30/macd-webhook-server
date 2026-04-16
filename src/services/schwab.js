@@ -19,7 +19,7 @@ const https = require('https');
 const keepAliveAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
 let tokens = { access_token: null, refresh_token: null, expires_at: 0 };
-let accountHash = null, refreshTimer = null, orphanCheckTimer = null, heartbeatTimer = null, pendingEntryTimer = null;
+let accountHash = null, refreshTimer = null, orphanCheckTimer = null, heartbeatTimer = null, pendingEntryTimer = null, pendingCloseTimer = null;
 
 const api = axios.create({
     baseURL: SCHWAB_API_BASE,
@@ -39,6 +39,8 @@ function getLimitBuffer() { return parseFloat(process.env.LIMIT_BUFFER_CENTS || 
 function getFloorCheckIntervalSecs() { return parseInt(process.env.FLOOR_CHECK_INTERVAL_SECS || '5'); }
 function getPendingEntryCheckIntervalSecs() { return parseInt(process.env.PENDING_ENTRY_CHECK_INTERVAL_SECS || '2'); }
 function getPendingEntryTimeoutSecs() { return parseInt(process.env.PENDING_ENTRY_TIMEOUT_SECS || '120'); }
+function getPendingCloseCheckIntervalSecs() { return parseInt(process.env.PENDING_CLOSE_CHECK_INTERVAL_SECS || '5'); }
+function getPendingCloseTimeoutSecs() { return parseInt(process.env.PENDING_CLOSE_TIMEOUT_SECS || '15'); }
 function getHardStopDistance(entryPrice) {
     const stopPct = parseFloat(process.env.HARD_STOP_PCT || '0.01');
     const minCents = parseFloat(process.env.HARD_STOP_MIN_CENTS || '0.01');
@@ -379,9 +381,17 @@ async function placeSellOrder(ticker, quantity, reason, price) {
     try {
         const r = await api.post(`/accounts/${getAccountId()}/orders`, order);
         const lat = Date.now() - t0;
-        log('ORDER', `SELL ${quantity} ${ticker} (${reason})`, { orderType, session, latency: lat });
+        const orderId = r.headers.location?.split('/').pop();
+        log('ORDER', `SELL ${quantity} ${ticker} (${reason})`, { orderType, session, latency: lat, orderId });
         await notify(`SELL ${quantity} ${ticker} (${reason}) | ${lat}ms`, 'sell');
-        return { success: true, latency: lat };
+        return {
+            success: true,
+            latency: lat,
+            orderId,
+            orderType,
+            session,
+            needsFillConfirmation: orderType === 'LIMIT'
+        };
     } catch (e) {
         log('ERROR', `SELL failed: ${ticker}`, { error: e.response?.data?.message || e.message, reason });
         return { success: false, error: e.response?.data?.message || e.message, latency: Date.now() - t0 };
@@ -529,6 +539,13 @@ async function closeOrphanPositions(pt) {
         log('WARN', `Auto-closing orphan: ${o.ticker} x${o.remainingQuantity}`, { tradeId: o.tradeId });
         const r = await placeSellOrder(o.ticker, o.remainingQuantity, 'ORPHAN_AUTO_CLOSE', o.entryPrice);
         if (r.success) {
+            if (r.needsFillConfirmation) {
+                pt.createPendingClose(o.ticker, o.entryPrice, o.remainingQuantity, r.orderId, 'ORPHAN_AUTO_CLOSE', {
+                    session: r.session,
+                    orderType: r.orderType
+                });
+                continue;
+            }
             pt.closePosition(o.ticker, o.entryPrice, 'ORPHAN_AUTO_CLOSE');
             await notify(`🔴 AUTO-CLOSED orphan: ${o.ticker}`, 'error');
         }
@@ -567,6 +584,13 @@ async function checkHeartbeats(pt) {
         const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HEARTBEAT_EXPIRED', sellPrice);
 
         if (result.success) {
+            if (result.needsFillConfirmation) {
+                pt.createPendingClose(pos.ticker, sellPrice, pos.remainingQuantity, result.orderId, 'HEARTBEAT_EXPIRED', {
+                    session: result.session,
+                    orderType: result.orderType
+                });
+                continue;
+            }
             // Journal the heartbeat expired event
             journalTrade({
                 action: 'HEARTBEAT_EXPIRED',
@@ -926,6 +950,136 @@ async function syncPendingEntries(pt, ticker = null) {
     return activated;
 }
 
+async function syncPendingCloses(pt, ticker = null) {
+    if (!isAuthenticated()) return [];
+
+    const pendingCloses = ticker
+        ? [pt.getPendingClose(ticker)].filter(Boolean)
+        : pt.getAllPendingCloses();
+
+    if (!pendingCloses.length) return [];
+
+    const brokerPositions = await getPositionsFromSchwab();
+    const resolved = [];
+    const now = Date.now();
+
+    for (const pending of pendingCloses) {
+        const pos = pt.getPosition(pending.ticker);
+        if (!pos) {
+            pt.clearPendingClose(pending.ticker, 'position_missing');
+            continue;
+        }
+
+        const orderDetails = await getOrderDetails(pending.orderId);
+        const brokerPos = findBrokerPosition(brokerPositions, pending.ticker);
+        const brokerQty = Number(brokerPos?.longQuantity || 0);
+        const averageFillPrice = orderDetails?.averageFillPrice || pending.signalPrice || pos.entryPrice;
+        const processedFilledQuantity = Number(pending.processedFilledQuantity || 0);
+        const totalFilledQuantity = Number(orderDetails?.filledQuantity || 0);
+        const deltaFilledQuantity = Math.max(0, totalFilledQuantity - processedFilledQuantity);
+
+        if ((!brokerPos || brokerQty <= 0) && (totalFilledQuantity > 0 || orderDetails?.status === 'FILLED')) {
+            const summary = pt.closePosition(pending.ticker, averageFillPrice, pending.reason);
+            if (summary) {
+                resolved.push(summary);
+                await notify(
+                    `CLOSED ${pending.ticker}\n` +
+                    `TradeID: ${summary.tradeId}\n` +
+                    `Entry: $${summary.entryPrice.toFixed(2)} -> Exit: $${averageFillPrice.toFixed(2)}\n` +
+                    `P&L: $${summary.pnl.toFixed(2)} (total: $${summary.totalPnL.toFixed(2)})\n` +
+                    `Hold: ${summary.holdMinutes}m | ${pending.reason}`,
+                    summary.totalPnL >= 0 ? 'profit' : 'loss'
+                );
+            }
+            continue;
+        }
+
+        if (deltaFilledQuantity > 0 && brokerQty > 0 && brokerQty < pos.remainingQuantity) {
+            const partial = pt.recordPartialCloseFill(
+                pending.ticker,
+                deltaFilledQuantity,
+                `PENDING_CLOSE_PARTIAL:${pending.reason}`,
+                averageFillPrice
+            );
+            if (partial) {
+                pt.updatePendingClose(pending.ticker, {
+                    processedFilledQuantity: totalFilledQuantity
+                });
+                log('ORDER', `Pending close partially filled ${pending.ticker}`, {
+                    tradeId: pending.tradeId,
+                    orderId: pending.orderId,
+                    sharesClosed: partial.sharesClosed,
+                    remaining: partial.remaining
+                });
+            }
+        }
+
+        const status = (orderDetails?.status || '').toUpperCase();
+        if (['CANCELED', 'CANCELLED', 'REJECTED', 'EXPIRED'].includes(status)) {
+            pt.clearPendingClose(pending.ticker, `order_${status.toLowerCase()}`);
+            continue;
+        }
+
+        const ageSecs = Math.round((now - new Date(pending.createdAt).getTime()) / 1000);
+        if (ageSecs < getPendingCloseTimeoutSecs()) continue;
+
+        if (!brokerPos || brokerQty <= 0) {
+            const summary = pt.closePosition(pending.ticker, averageFillPrice, pending.reason);
+            if (summary) resolved.push(summary);
+            continue;
+        }
+
+        log('WARN', `Pending close still unfilled: ${pending.ticker}`, {
+            tradeId: pending.tradeId,
+            orderId: pending.orderId,
+            status: orderDetails?.status || 'UNKNOWN',
+            ageSecs,
+            brokerQty
+        });
+
+        await cancelOrdersForTicker(pending.ticker);
+        await new Promise(resolve => setTimeout(resolve, 300));
+
+        const currentPrice = await getCurrentPrice(pending.ticker);
+        const retryPrice = currentPrice > 0 ? currentPrice : pending.signalPrice || pos.entryPrice;
+        const replacement = await placeSellOrder(
+            pending.ticker,
+            brokerQty,
+            `${pending.reason}_RETRY`,
+            retryPrice
+        );
+
+        if (!replacement.success) continue;
+
+        if (replacement.needsFillConfirmation) {
+            pt.updatePendingClose(pending.ticker, {
+                orderId: replacement.orderId,
+                requestedQuantity: brokerQty,
+                signalPrice: retryPrice,
+                createdAt: new Date().toISOString(),
+                session: replacement.session,
+                orderType: replacement.orderType
+            });
+            continue;
+        }
+
+        const summary = pt.closePosition(pending.ticker, retryPrice, pending.reason);
+        if (summary) {
+            resolved.push(summary);
+            await notify(
+                `CLOSED ${pending.ticker}\n` +
+                `TradeID: ${summary.tradeId}\n` +
+                `Entry: $${summary.entryPrice.toFixed(2)} -> Exit: $${retryPrice.toFixed(2)}\n` +
+                `P&L: $${summary.pnl.toFixed(2)} (total: $${summary.totalPnL.toFixed(2)})\n` +
+                `Hold: ${summary.holdMinutes}m | ${pending.reason}`,
+                summary.totalPnL >= 0 ? 'profit' : 'loss'
+            );
+        }
+    }
+
+    return resolved;
+}
+
 function decideServerScale(pos, profitPct) {
     if (!isServerManagedScalesEnabled()) return null;
 
@@ -946,6 +1100,7 @@ async function checkManagedExits(pt) {
     if (!isAuthenticated()) return;
 
     await syncPendingEntries(pt);
+    await syncPendingCloses(pt);
 
     const allPositions = pt.getAllPositions().filter(pos => pos.remainingQuantity > 0 && !pos.isClosing && !pos.isOrphan);
     if (allPositions.length === 0) return;
@@ -971,6 +1126,13 @@ async function checkManagedExits(pt) {
             await new Promise(resolve => setTimeout(resolve, 300));
             const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'HARD_STOP', currentPrice);
             if (result.success) {
+                if (result.needsFillConfirmation) {
+                    pt.createPendingClose(pos.ticker, currentPrice, pos.remainingQuantity, result.orderId, 'HARD_STOP', {
+                        session: result.session,
+                        orderType: result.orderType
+                    });
+                    continue;
+                }
                 journalTrade({
                     action: 'HARD_STOP',
                     tradeId: pos.tradeId,
@@ -1036,6 +1198,13 @@ async function checkManagedExits(pt) {
             await new Promise(resolve => setTimeout(resolve, 300));
             const result = await placeSellOrder(pos.ticker, pos.remainingQuantity, 'SERVER_FLOOR_BREACH', currentPrice);
             if (result.success) {
+                if (result.needsFillConfirmation) {
+                    pt.createPendingClose(pos.ticker, currentPrice, pos.remainingQuantity, result.orderId, 'SERVER_FLOOR_BREACH', {
+                        session: result.session,
+                        orderType: result.orderType
+                    });
+                    continue;
+                }
                 journalTrade({
                     action: 'SERVER_FLOOR_BREACH',
                     tradeId: pos.tradeId,
@@ -1082,6 +1251,15 @@ function startPendingEntryMonitor(pt) {
     log('INFO', `Pending-entry monitor started (${intervalSecs}s)`);
 }
 
+function startPendingCloseMonitor(pt) {
+    if (pendingCloseTimer) clearInterval(pendingCloseTimer);
+    const intervalSecs = getPendingCloseCheckIntervalSecs();
+    pendingCloseTimer = setInterval(async () => {
+        await syncPendingCloses(pt);
+    }, intervalSecs * 1000);
+    log('INFO', `Pending-close monitor started (${intervalSecs}s)`);
+}
+
 function startFloorMonitor(pt) {
     if (floorMonitorTimer) clearInterval(floorMonitorTimer);
     const intervalSecs = getFloorCheckIntervalSecs();
@@ -1103,6 +1281,7 @@ module.exports = {
         checkHeartbeats, startHeartbeatCheck,
         checkFloors: checkManagedExits, startFloorMonitor,
         syncPendingEntries, startPendingEntryMonitor,
+        syncPendingCloses, startPendingCloseMonitor,
         __test: {
             calculateFloor,
             getActiveFloorState,

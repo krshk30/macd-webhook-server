@@ -58,5 +58,6 @@ app.listen(PORT, () => {
     schwabService.startOrphanCheck(positions);
     schwabService.startHeartbeatCheck(positions);
     schwabService.startPendingEntryMonitor(positions);
+    schwabService.startPendingCloseMonitor(positions);
     schwabService.startFloorMonitor(positions);
 });

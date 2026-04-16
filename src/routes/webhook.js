@@ -53,12 +53,15 @@ router.post('/webhook', async (req, res) => {
         const pos = positions.getPosition(ticker);
         if (pos) {
             positions.touchPosition(ticker);
+            const pendingClose = positions.getPendingClose(ticker);
             return res.json({
-                status: 'heartbeat_ok',
+                status: pendingClose ? 'heartbeat_pending_close' : 'heartbeat_ok',
                 ticker,
                 tradeId: pos.tradeId,
                 remaining: pos.remainingQuantity,
                 currentStop: positions.getStopPrice(ticker),
+                pendingClose: !!pendingClose,
+                pendingCloseReason: pendingClose?.reason || null,
                 tier: body.tier,
                 profitPct: body.profitPct,
                 serverLatency: Date.now() - t0
@@ -157,6 +160,7 @@ async function handleBuy(ticker, price, body) {
 
 async function handleScale(ticker, price, body) {
     await schwabService.syncPendingEntries(positions, ticker);
+    await schwabService.syncPendingCloses(positions, ticker);
     const pos = positions.getPosition(ticker);
 
     if (!pos) {
@@ -166,6 +170,11 @@ async function handleScale(ticker, price, body) {
         }
         log('REJECT', `SCALE ${ticker}: no position`);
         return { success: false, rejected: 'no position' };
+    }
+
+    if (positions.hasPendingClose(ticker)) {
+        log('REJECT', `SCALE ${ticker}: close already pending`);
+        return { success: false, rejected: 'close pending' };
     }
 
     const level = body.level;
@@ -234,6 +243,7 @@ async function handleScale(ticker, price, body) {
 
 async function handleClose(ticker, price, body) {
     await schwabService.syncPendingEntries(positions, ticker);
+    await schwabService.syncPendingCloses(positions, ticker);
     let pos = positions.getPosition(ticker);
 
     if (!pos) {
@@ -283,6 +293,20 @@ async function handleClose(ticker, price, body) {
         return { success: false, rejected: 'no position' };
     }
 
+    const existingPendingClose = positions.getPendingClose(ticker);
+    if (existingPendingClose) {
+        return {
+            success: true,
+            action: 'CLOSE',
+            tradeId: pos.tradeId,
+            ticker,
+            reason: existingPendingClose.reason,
+            pending: true,
+            orderId: existingPendingClose.orderId,
+            note: 'close already pending'
+        };
+    }
+
     const exitPrice = parseFloat(price) || 0;
     const reason = body.reason || 'unknown';
 
@@ -321,6 +345,40 @@ async function handleClose(ticker, price, body) {
             ticker,
             reason,
             rejected: result.error || 'sell failed',
+            schwabLatency: result.latency
+        };
+    }
+
+    if (result.needsFillConfirmation) {
+        positions.createPendingClose(
+            ticker,
+            exitPrice,
+            pos.remainingQuantity,
+            result.orderId,
+            reason,
+            {
+                session: result.session,
+                orderType: result.orderType
+            }
+        );
+
+        await notify(
+            `CLOSE PENDING ${ticker}\n` +
+            `TradeID: ${pos.tradeId}\n` +
+            `Qty: ${pos.remainingQuantity}\n` +
+            `Reason: ${reason}\n` +
+            `Order: ${result.orderType} ${result.session}`,
+            'sell'
+        );
+
+        return {
+            success: true,
+            action: 'CLOSE',
+            tradeId: pos.tradeId,
+            ticker,
+            reason,
+            pending: true,
+            orderId: result.orderId,
             schwabLatency: result.latency
         };
     }

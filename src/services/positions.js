@@ -16,6 +16,7 @@ const { log, journalTrade, generateTradeId, setTradeId, clearTradeId } = require
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '../../data');
 const POSITIONS_FILE = path.join(DATA_DIR, 'positions.json');
 const PENDING_FILE = path.join(DATA_DIR, 'pending.json');
+const PENDING_CLOSES_FILE = path.join(DATA_DIR, 'pending_closes.json');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 // Ensure data directory exists
@@ -24,6 +25,7 @@ try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) { /* ok */ }
 // --- In-Memory State ---
 const positions = new Map();
 const pendingEntries = new Map();
+const pendingCloses = new Map();
 let dailyPnL = 0, dailyTradeCount = 0, lastResetDate = new Date().toDateString();
 const recentAlerts = new Map();
 const DEDUP_WINDOW_MS = parseInt(process.env.DEDUP_WINDOW_MS || '5000');
@@ -87,8 +89,11 @@ function saveToDisk() {
         for (const [k, v] of positions) { posData[k] = v; }
         const pendingData = {};
         for (const [k, v] of pendingEntries) { pendingData[k] = v; }
+        const pendingCloseData = {};
+        for (const [k, v] of pendingCloses) { pendingCloseData[k] = v; }
         fs.writeFileSync(POSITIONS_FILE, JSON.stringify(posData, null, 2));
         fs.writeFileSync(PENDING_FILE, JSON.stringify(pendingData, null, 2));
+        fs.writeFileSync(PENDING_CLOSES_FILE, JSON.stringify(pendingCloseData, null, 2));
         fs.writeFileSync(STATE_FILE, JSON.stringify({
             dailyPnL, dailyTradeCount, lastResetDate,
             savedAt: new Date().toISOString()
@@ -136,6 +141,27 @@ function loadFromDisk() {
         }
     } catch (e) {
         log('WARN', 'Could not load pending entries from disk', { error: e.message });
+    }
+
+    try {
+        if (fs.existsSync(PENDING_CLOSES_FILE)) {
+            const raw = JSON.parse(fs.readFileSync(PENDING_CLOSES_FILE, 'utf8'));
+            let loaded = 0;
+            for (const [ticker, pendingClose] of Object.entries(raw)) {
+                pendingCloses.set(ticker, pendingClose);
+                if (pendingClose.tradeId) setTradeId(ticker, pendingClose.tradeId);
+                const pos = positions.get(ticker);
+                if (pos) pos.isClosing = true;
+                loaded++;
+            }
+            if (loaded > 0) {
+                log('INFO', `Restored ${loaded} pending close${loaded === 1 ? '' : 's'} from disk`, {
+                    tickers: Object.keys(raw)
+                });
+            }
+        }
+    } catch (e) {
+        log('WARN', 'Could not load pending closes from disk', { error: e.message });
     }
 
     try {
@@ -321,6 +347,78 @@ function clearPendingEntry(ticker, reason = 'cleared') {
     return pending;
 }
 
+function createPendingClose(ticker, signalPrice, quantity, orderId, reason, meta = {}) {
+    const pos = positions.get(ticker);
+    if (!pos) return null;
+
+    const pendingClose = {
+        ticker,
+        tradeId: pos.tradeId,
+        signalPrice,
+        requestedQuantity: quantity,
+        orderId,
+        reason,
+        createdAt: new Date().toISOString(),
+        lastSignalTime: Date.now(),
+        session: meta.session || 'UNKNOWN',
+        orderType: meta.orderType || 'UNKNOWN',
+        processedFilledQuantity: meta.processedFilledQuantity || 0
+    };
+
+    pos.isClosing = true;
+    pendingCloses.set(ticker, pendingClose);
+    saveToDisk();
+
+    log('POSITION', `Pending close ${ticker}: ${quantity} @ $${Number(signalPrice || 0).toFixed(2)}`, {
+        tradeId: pendingClose.tradeId,
+        orderId,
+        reason,
+        session: pendingClose.session,
+        orderType: pendingClose.orderType
+    });
+
+    return pendingClose;
+}
+
+function getPendingClose(ticker) {
+    return pendingCloses.get(ticker) || null;
+}
+
+function hasPendingClose(ticker) {
+    return pendingCloses.has(ticker);
+}
+
+function getAllPendingCloses() {
+    return Array.from(pendingCloses.values());
+}
+
+function updatePendingClose(ticker, updates = {}) {
+    const pendingClose = pendingCloses.get(ticker);
+    if (!pendingClose) return null;
+    Object.assign(pendingClose, updates);
+    saveToDisk();
+    return pendingClose;
+}
+
+function clearPendingClose(ticker, reason = 'cleared') {
+    const pendingClose = pendingCloses.get(ticker);
+    if (!pendingClose) return null;
+    pendingCloses.delete(ticker);
+    const pos = positions.get(ticker);
+    if (pos) {
+        pos.isClosing = false;
+    } else {
+        clearTradeId(ticker);
+    }
+    saveToDisk();
+    log('POSITION', `Cleared pending close ${ticker}`, {
+        tradeId: pendingClose.tradeId,
+        reason,
+        orderId: pendingClose.orderId
+    });
+    return pendingClose;
+}
+
 // --- Touch (Heartbeat) ---
 function getPosition(ticker) { return positions.get(ticker) || null; }
 
@@ -332,6 +430,8 @@ function touchPosition(ticker) {
     }
     const pending = pendingEntries.get(ticker);
     if (pending) pending.lastSignalTime = Date.now();
+    const pendingClose = pendingCloses.get(ticker);
+    if (pendingClose) pendingClose.lastSignalTime = Date.now();
 }
 
 // v1.3.0: Stop loss tracking
@@ -474,6 +574,44 @@ function scalePosition(ticker, sellPct, reason, price) {
     return { sharesToSell: sell, pnl };
 }
 
+function recordPartialCloseFill(ticker, sharesFilled, reason, exitPrice) {
+    const p = positions.get(ticker);
+    if (!p || sharesFilled <= 0) return null;
+
+    const qty = Math.min(sharesFilled, p.remainingQuantity);
+    if (qty <= 0) return null;
+
+    p.remainingQuantity -= qty;
+    const pnl = (exitPrice - p.entryPrice) * qty;
+    dailyPnL += pnl;
+    p.lastSignalTime = Date.now();
+
+    const partialEntry = { reason, shares: qty, price: exitPrice, pnl, time: new Date().toISOString() };
+    p.scaledExits.push(partialEntry);
+    saveToDisk();
+
+    journalTrade({
+        action: 'PARTIAL_CLOSE',
+        tradeId: p.tradeId,
+        ticker,
+        reason,
+        sharesClosed: qty,
+        remaining: p.remainingQuantity,
+        entryPrice: p.entryPrice,
+        exitPrice,
+        pnl: pnl.toFixed(2),
+        profitPct: ((exitPrice - p.entryPrice) / p.entryPrice * 100).toFixed(2)
+    });
+
+    log('POSITION', `Partial close ${ticker}: sold ${qty}/${p.initialQuantity} (${reason})`, {
+        tradeId: p.tradeId,
+        remaining: p.remainingQuantity,
+        pnl: pnl.toFixed(2)
+    });
+
+    return { sharesClosed: qty, pnl, remaining: p.remainingQuantity };
+}
+
 // --- Close Position ---
 function closePosition(ticker, exitPrice, reason) {
     const p = positions.get(ticker);
@@ -532,6 +670,7 @@ function closePosition(ticker, exitPrice, reason) {
 
     clearTradeId(ticker);
     positions.delete(ticker);
+    pendingCloses.delete(ticker);
     saveToDisk();
 
     return summary;
@@ -577,6 +716,18 @@ function getStatus() {
             orderType: p.orderType,
             ageSecs: Math.round((Date.now() - new Date(p.createdAt).getTime()) / 1000)
         })),
+        pendingCloses: Array.from(pendingCloses.values()).map(p => ({
+            ticker: p.ticker,
+            tradeId: p.tradeId,
+            signalPrice: p.signalPrice,
+            requestedQuantity: p.requestedQuantity,
+            orderId: p.orderId,
+            reason: p.reason,
+            session: p.session,
+            orderType: p.orderType,
+            processedFilledQuantity: p.processedFilledQuantity || 0,
+            ageSecs: Math.round((Date.now() - new Date(p.createdAt).getTime()) / 1000)
+        })),
         positionCount: positions.size,
         pendingCount: pendingEntries.size,
         dailyPnL: dailyPnL.toFixed(2),
@@ -589,9 +740,10 @@ module.exports = {
     positions: {
         isDuplicate, canOpenPosition, openPosition,
         createPendingEntry, activatePendingEntry, getPendingEntry, hasPendingEntry, getAllPendingEntries, clearPendingEntry,
+        createPendingClose, getPendingClose, hasPendingClose, getAllPendingCloses, updatePendingClose, clearPendingClose,
         getPosition,
         touchPosition, setStopOrder, getStopPrice, getStopOrderId, updateStopPrice,
-        getHeartbeatExpired, previewScalePosition, scalePosition, closePosition,
+        getHeartbeatExpired, previewScalePosition, scalePosition, recordPartialCloseFill, closePosition,
         markMilestone, isMilestoneHit, getStatus, getAllPositions, markOrphan, getOrphans
     }
 };

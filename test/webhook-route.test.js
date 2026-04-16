@@ -16,7 +16,9 @@ function buildWebhookApp(overrides = {}) {
         touched: 0,
         opened: 0,
         pendingCreated: [],
+        pendingCloseCreated: [],
         pendingCleared: [],
+        pendingCloseCleared: [],
         cancelCalls: [],
         sellCalls: [],
         logs: [],
@@ -52,6 +54,10 @@ function buildWebhookApp(overrides = {}) {
                 state.syncCalls.push(args);
                 return [];
             },
+            syncPendingCloses: async (...args) => {
+                state.syncCalls.push(['close', ...args]);
+                return [];
+            },
             getSessionType: () => 'NORMAL'
         }
     };
@@ -62,13 +68,17 @@ function buildWebhookApp(overrides = {}) {
             getPendingEntry: () => null,
             hasPendingEntry: () => false,
             getAllPendingEntries: () => [],
+            getPendingClose: () => null,
+            hasPendingClose: () => false,
             touchPosition: () => { state.touched += 1; },
             getStopPrice: () => 0,
             isDuplicate: () => false,
             canOpenPosition: () => ({ allowed: true }),
             openPosition: () => { state.opened += 1; },
             createPendingEntry: (...args) => { state.pendingCreated.push(args); },
+            createPendingClose: (...args) => { state.pendingCloseCreated.push(args); },
             clearPendingEntry: (...args) => { state.pendingCleared.push(args); },
+            clearPendingClose: (...args) => { state.pendingCloseCleared.push(args); },
             isMilestoneHit: () => false,
             previewScalePosition: () => null,
             markMilestone: () => {},
@@ -588,5 +598,59 @@ test('close request uses sell and notification flow for an open position', async
         assert.deepEqual(state.sellCalls[0], ['AAPL', 6, 'Close: MACD_BEAR', 102.5]);
         assert.equal(state.notifications.length, 1);
         assert.match(state.notifications[0].message, /CLOSED AAPL/);
+    });
+});
+
+test('close request keeps the position open locally when the close order still needs fill confirmation', async () => {
+    process.env.WEBHOOK_TOKEN = 'secret';
+
+    const position = {
+        tradeId: 'T-AAPL',
+        entryPrice: 100,
+        remainingQuantity: 6,
+        isClosing: false
+    };
+
+    const { app, state } = buildWebhookApp({
+        schwabService: {
+            placeSellOrder: async (...args) => {
+                state.sellCalls.push(args);
+                return {
+                    success: true,
+                    latency: 9,
+                    orderId: 'OID-CLOSE-1',
+                    orderType: 'LIMIT',
+                    session: 'SEAMLESS',
+                    needsFillConfirmation: true
+                };
+            }
+        },
+        positions: {
+            getPosition: () => position
+        }
+    });
+
+    await withServer(app, async baseUrl => {
+        const response = await fetch(`${baseUrl}/webhook`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+                action: 'CLOSE',
+                ticker: 'AAPL',
+                token: 'secret',
+                price: 99.4,
+                reason: 'MACD_BEAR'
+            })
+        });
+
+        assert.equal(response.status, 200);
+        const body = await response.json();
+        assert.equal(body.success, true);
+        assert.equal(body.pending, true);
+        assert.equal(body.orderId, 'OID-CLOSE-1');
+        assert.equal(state.pendingCloseCreated.length, 1);
+        assert.equal(state.pendingCloseCreated[0][0], 'AAPL');
+        assert.equal(state.notifications.length, 1);
+        assert.match(state.notifications[0].message, /CLOSE PENDING AAPL/);
     });
 });
