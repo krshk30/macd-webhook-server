@@ -586,6 +586,13 @@ This file is the running record of repository analysis and updates for the curre
 - Updated `README.md` env-var docs to reflect the active hard-stop configuration and remove the stale `STOP_LOSS_CENTS` reference.
 - Tightened webhook dedup semantics so different `SCALE` levels and different `CLOSE` reasons are no longer collapsed into the same `ticker:action` key.
 - Added regression coverage for dedup specificity in both the positions service and webhook route tests.
+- Expanded the debug router so Railway volume logs can be read over HTTP:
+  - `/debug/logs`
+  - `/debug/logs/:date`
+  - `/debug/journal/:date`
+  - `/debug/recent`
+  - `/debug/status`
+- Added route-level tests for the new debug log and status endpoints.
 
 ## Ongoing Rule For Future Sessions
 
